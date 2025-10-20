@@ -1,3 +1,7 @@
 streamlit
 pymupdf
 pandas
+requests
+beautifulsoup4
+lxml
+firecrawl-py
