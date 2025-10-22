@@ -133,6 +133,30 @@ def pick_image_and_price_bs4(html: str, base_url: str) -> Tuple[str, str]:
 
     return img_url or "", price or ""
 
+def best_from_picture(picture_tag) -> str:
+    """Return the largest URL from <picture><source srcset=...>."""
+    if not picture_tag:
+        return ""
+    best_url, best_w = "", -1
+    for src in picture_tag.find_all("source"):
+        ss = src.get("srcset") or src.get("data-srcset") or ""
+        for part in ss.split(","):
+            s = part.strip()
+            if not s:
+                continue
+            pieces = s.split()
+            url = pieces[0]
+            w = -1
+            if len(pieces) > 1 and pieces[1].endswith("w"):
+                try:
+                    w = int(pieces[1][:-1])
+                except Exception:
+                    w = -1
+            if w > best_w:
+                best_w, best_url = w, url
+    return best_url
+
+
 # ----------------- Firecrawl v2 (REST) helpers -----------------
 def firecrawl_scrape_v2(url: str, api_key: str, mode: str = "simple") -> dict:
     """
@@ -271,18 +295,27 @@ def best_from_srcset(srcset_value: str) -> str:
     return best_url
 
 def parse_image_and_price_lumens(scrape: dict) -> Tuple[str, str]:
-    """Lumens: dig through srcset/lazy attrs if og:image is missing; price via JSON-LD/meta."""
-    if not scrape: return "", ""
+    """Lumens: handle og:image, JSON-LD, <picture><source srcset>, lazy attrs; price via JSON-LD/meta/visible text."""
+    if not scrape: 
+        return "", ""
     data = scrape.get("data") or {}
     meta = data.get("metadata") or {}
     html = data.get("html") or ""
     soup = BeautifulSoup(html or "", "lxml")
 
     # --- IMAGE ---
-    img = meta.get("og:image") or meta.get("twitter:image") or meta.get("image") or ""
+    # 0) full set of meta fallbacks
+    img = (
+        meta.get("og:image")
+        or meta.get("og:image:secure_url")
+        or meta.get("og:image:url")
+        or meta.get("twitter:image")
+        or meta.get("image")
+        or ""
+    )
 
+    # 1) JSON-LD Product.image
     if not img:
-        # JSON-LD Product.image
         for tag in soup.find_all("script", type="application/ld+json"):
             try:
                 obj = json.loads(tag.string or "")
@@ -295,15 +328,42 @@ def parse_image_and_price_lumens(scrape: dict) -> Tuple[str, str]:
                             img = im[0]
                         elif isinstance(im, str) and im:
                             img = im
-                        if img: break
-                if img: break
+                        if img:
+                            break
+                if img:
+                    break
             except Exception:
                 pass
 
+    # 2) <picture><source srcset="..."> (common on Lumens PDP)
     if not img:
-        # srcset/lazy fallbacks in likely gallery scopes
-        gallery = soup.select_one('[class*="gallery"], [id*="gallery"], [class*="pdp"], [id*="pdp"]')
-        scope = gallery or soup
+        # Prefer a hero/pdp area if present
+        scope = soup.select_one('[class*="pdp"], [id*="pdp"], [class*="gallery"], [id*="gallery"]') or soup
+        best_pic = None
+        best_score = -1
+        for pict in scope.find_all("picture"):
+            # score pictures with product/hero-ish classes
+            s = " ".join(
+                [str(x) for x in (pict.get("class") or []) + [pict.get("id") or ""]]
+            ).lower()
+            score = 0
+            if any(k in s for k in ("product", "hero", "main", "primary", "gallery", "pdp")):
+                score += 5
+            # prefer pictures that have a wide srcset candidate
+            cand_url = best_from_picture(pict)
+            if cand_url:
+                score += 3
+            if score > best_score:
+                best_score = score
+                best_pic = pict
+        if best_pic:
+            cand = best_from_picture(best_pic)
+            if cand:
+                img = cand
+
+    # 3) <img> fallbacks including srcset/data-*
+    if not img:
+        scope = soup.select_one('[class*="pdp"], [id*="pdp"], [class*="gallery"], [id*="gallery"]') or soup
         candidates = []
         for imgtag in scope.find_all("img"):
             cand = imgtag.get("src") or imgtag.get("data-src") or ""
@@ -311,18 +371,19 @@ def parse_image_and_price_lumens(scrape: dict) -> Tuple[str, str]:
                 ss = imgtag.get("srcset") or imgtag.get("data-srcset")
                 if ss:
                     cand = best_from_srcset(ss)
+            # some sites use custom attrs:
+            cand = cand or imgtag.get("data-zoom-image") or imgtag.get("data-large_image")
             if cand:
                 score = 0
-                s = (imgtag.get("class") or []) + [imgtag.get("id") or ""]
-                s = " ".join([str(x) for x in s]).lower()
-                if "product" in s or "hero" in s or "image" in s:
+                s = " ".join([str(x) for x in (imgtag.get("class") or []) + [imgtag.get("id") or ""]]).lower()
+                if any(k in s for k in ("product", "hero", "primary", "main", "zoom")):
                     score += 5
-                url_s = cand.lower()
-                if any(k in url_s for k in ("cloudinary", "scene7", "akamai", "cdn", "lumens", "images", "media")):
+                if any(k in cand.lower() for k in ("cloudinary", "scene7", "akamai", "cdn", "lumens", "images", "media")):
                     score += 3
                 try:
                     w = int(imgtag.get("width") or 0)
-                    if w >= 600: score += 2
+                    if w >= 600: 
+                        score += 2
                 except Exception:
                     pass
                 candidates.append((score, cand))
@@ -330,11 +391,53 @@ def parse_image_and_price_lumens(scrape: dict) -> Tuple[str, str]:
             candidates.sort(key=lambda x: x[0], reverse=True)
             img = candidates[0][1]
 
+    # 4) <link rel="preload" as="image">
     if not img:
-        # <link rel="preload" as="image" href="...">
         preload = soup.find("link", rel=lambda v: v and "preload" in v, attrs={"as": "image"})
         if preload and preload.get("href"):
             img = preload["href"]
+
+    # --- PRICE ---
+    price = ""
+    j = data.get("json")
+    if isinstance(j, dict):
+        content = j.get("content") if isinstance(j.get("content"), dict) else j
+        if isinstance(content, dict):
+            price = (content.get("price") or "").strip()
+
+    if not price:
+        for tag in soup.find_all("script", type="application/ld+json"):
+            try:
+                obj = json.loads(tag.string or "")
+            except Exception:
+                continue
+            objs = obj if isinstance(obj, list) else [obj]
+            for o in objs:
+                t = o.get("@type")
+                if t == "Product" or (isinstance(t, list) and "Product" in t):
+                    offers = o.get("offers") or {}
+                    if isinstance(offers, list):
+                        offers = offers[0] if offers else {}
+                    p = offers.get("price") or (offers.get("priceSpecification") or {}).get("price")
+                    if p:
+                        price = p if str(p).startswith("$") else f"${p}"
+                        break
+            if price:
+                break
+
+    if not price:
+        m = soup.find("meta", attrs={"itemprop": "price"}) or soup.find("meta", attrs={"property": "product:price:amount"})
+        if m and m.get("content"):
+            val = m["content"]
+            price = val if str(val).startswith("$") else f"${val}"
+
+    if not price:
+        t = soup.get_text(" ", strip=True)
+        m = PRICE_RE.search(t)
+        if m:
+            price = m.group(0)
+
+    return (img or ""), (price or "")
 
     # --- PRICE ---
     price = ""
@@ -591,3 +694,4 @@ with tab3:
         st.write("**Price:**", price or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
