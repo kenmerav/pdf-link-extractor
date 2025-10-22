@@ -244,7 +244,7 @@ def firecrawl_scrape_v2(url: str, api_key: str, mode: str = "simple") -> dict:
         return {}
 
 def firecrawl_scrape_v2_aggressive(url: str, api_key: str) -> dict:
-    """Aggressive: wait + scroll + evaluate JS to extract srcset/lazy images + price."""
+    """Aggressive: deeper waits/scrolls + hover + JS harvest of lazy/srcset images and price."""
     if not api_key:
         return {}
     payload = {
@@ -258,99 +258,130 @@ def firecrawl_scrape_v2_aggressive(url: str, api_key: str) -> dict:
             }}
         ],
         "proxy": "auto",
-        "timeout": 60000,
+        "timeout": 70000,
         "device": "desktop",
         "actions": [
-            {"type": "wait", "milliseconds": 800},
+            # give the page time to boot React
+            {"type": "wait", "milliseconds": 1200},
+
+            # scroll in two stages to trigger lazy loads
             {"type": "scroll", "y": 800},
-            {"type": "wait", "milliseconds": 1000},
-            {"type": "waitForSelector", "selector": "picture source[srcset], img[srcset], img[data-src], img[data-srcset], img[data-enlarged]", "timeout": 8000},
-            {
-                "type": "evaluate",
-                "script": """
-                (() => {
-                  function bestFromSrcset(ss) {
-                    if (!ss) return "";
-                    let best = ["", -1];
-                    ss.split(",").forEach(part => {
-                      const p = part.trim().split(/\\s+/);
-                      const url = p[0] || "";
-                      let w = -1;
-                      if (p[1] && /w$/.test(p[1])) {
-                        const n = parseInt(p[1].slice(0, -1), 10);
-                        if (!isNaN(n)) w = n;
-                      }
-                      if (w > best[1]) best = [url, w];
-                    });
-                    return best[0];
-                  }
+            {"type": "wait", "milliseconds": 1200},
+            {"type": "scroll", "y": 1600},
+            {"type": "wait", "milliseconds": 1200},
 
-                  const out = { images: [], price: "" };
+            # wait for any common gallery hooks to exist
+            {"type": "waitForSelector",
+             "selector": "[data-enlarged], img[data-enlarged], [data-testid*='ImageCarousel'], [class*='ImageCarousel'], picture source[srcset], img[srcset], img[data-src], img[data-srcset]",
+             "timeout": 10000},
 
-                  document.querySelectorAll('meta[property="og:image"],meta[name="og:image"],meta[property="og:image:url"],meta[property="og:image:secure_url"],meta[name="twitter:image"]').forEach(m => {
-                    const v = m.getAttribute("content");
-                    if (v) out.images.push(v);
-                  });
+            # nudge: hover over a likely gallery/hero image so some sites attach hi-res on hover
+            {"type": "evaluate",
+             "script": """
+               (()=>{
+                 const cand = document.querySelector('[data-enlarged], [data-testid*="ImageCarousel"] img, img[data-src], img[srcset]') ||
+                               document.querySelector('img');
+                 if (cand) {
+                   const ev = new MouseEvent('mouseover', {bubbles:true, cancelable:true, view:window});
+                   cand.dispatchEvent(ev);
+                 }
+               })();
+             """},
 
-                  document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
-                    try {
-                      const data = JSON.parse(s.textContent || "null");
-                      const arr = Array.isArray(data) ? data : [data];
-                      arr.forEach(obj => {
-                        const t = obj && obj["@type"];
-                        const isProduct = t === "Product" || (Array.isArray(t) && t.includes("Product"));
-                        if (isProduct && obj.image) {
-                          if (Array.isArray(obj.image)) out.images.push(...obj.image);
-                          else out.images.push(obj.image);
-                          if (!out.price && obj.offers) {
-                            const offers = Array.isArray(obj.offers) ? obj.offers[0] : obj.offers;
-                            const p = offers && (offers.price || (offers.priceSpecification && offers.priceSpecification.price));
-                            if (p) out.price = String(p);
-                          }
-                        }
-                      });
-                    } catch {}
-                  });
+            {"type": "wait", "milliseconds": 900},
 
-                  document.querySelectorAll("picture source[srcset], source[srcset]").forEach(src => {
-                    const best = bestFromSrcset(src.getAttribute("srcset"));
-                    if (best) out.images.push(best);
-                  });
+            # harvest: collect images from meta, JSON-LD, <picture>/<img> (incl. lazy/srcset), and find a price
+            {"type": "evaluate",
+             "script": """
+               (() => {
+                 function bestFromSrcset(ss) {
+                   if (!ss) return "";
+                   let best = ["", -1];
+                   ss.split(",").forEach(part => {
+                     const p = part.trim().split(/\\s+/);
+                     const url = p[0] || "";
+                     let w = -1;
+                     if (p[1] && /w$/.test(p[1])) {
+                       const n = parseInt(p[1].slice(0, -1), 10);
+                       if (!isNaN(n)) w = n;
+                     }
+                     if (w > best[1]) best = [url, w];
+                   });
+                   return best[0];
+                 }
 
-                  document.querySelectorAll("img").forEach(img => {
-                    let cand = img.getAttribute("data-enlarged") || img.getAttribute("src") || img.getAttribute("data-src") || "";
-                    if (!cand) {
-                      const ss = img.getAttribute("srcset") || img.getAttribute("data-srcset");
-                      if (ss) cand = bestFromSrcset(ss);
-                    }
-                    cand = cand || img.getAttribute("data-zoom-image") || img.getAttribute("data-large_image") || "";
-                    if (cand) out.images.push(cand);
-                  });
+                 const out = { images: [], price: "" };
 
-                  if (!out.price) {
-                    const m = (document.body.innerText || "").match(/\\$\\s?\\d{1,3}(?:,\\d{3})*(?:\\.\\d{2})?/);
-                    if (m) out.price = m[0];
-                  }
+                 // Meta (OG/Twitter)
+                 document.querySelectorAll('meta[property="og:image"],meta[name="og:image"],meta[property="og:image:url"],meta[property="og:image:secure_url"],meta[name="twitter:image"]').forEach(m => {
+                   const v = m.getAttribute("content");
+                   if (v) out.images.push(v);
+                 });
 
-                  const seen = new Set();
-                  out.images = out.images.filter(u => (u && !seen.has(u) && seen.add(u)));
-                  return out;
-                })();
-                """
-            }
+                 // JSON-LD Product
+                 document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
+                   try {
+                     const data = JSON.parse(s.textContent || "null");
+                     const arr = Array.isArray(data) ? data : [data];
+                     arr.forEach(obj => {
+                       const t = obj && obj["@type"];
+                       const isProduct = t === "Product" || (Array.isArray(t) && t.includes("Product"));
+                       if (isProduct && obj.image) {
+                         if (Array.isArray(obj.image)) out.images.push(...obj.image);
+                         else out.images.push(obj.image);
+                         if (!out.price && obj.offers) {
+                           const offers = Array.isArray(obj.offers) ? obj.offers[0] : obj.offers;
+                           const p = offers && (offers.price || (offers.priceSpecification && offers.priceSpecification.price));
+                           if (p) out.price = String(p);
+                         }
+                       }
+                     });
+                   } catch {}
+                 });
+
+                 // <picture> with srcset
+                 document.querySelectorAll("picture source[srcset], source[srcset]").forEach(src => {
+                   const best = bestFromSrcset(src.getAttribute("srcset"));
+                   if (best) out.images.push(best);
+                 });
+
+                 // <img> (lazy + srcset variants)
+                 document.querySelectorAll("img").forEach(img => {
+                   let cand = img.getAttribute("data-enlarged") || img.getAttribute("src") || img.getAttribute("data-src") || "";
+                   if (!cand) {
+                     const ss = img.getAttribute("srcset") || img.getAttribute("data-srcset");
+                     if (ss) cand = bestFromSrcset(ss);
+                   }
+                   cand = cand || img.getAttribute("data-zoom-image") || img.getAttribute("data-large_image") || "";
+                   if (cand) out.images.push(cand);
+                 });
+
+                 // Visible price fallback
+                 if (!out.price) {
+                   const m = (document.body.innerText || "").match(/\\$\\s?\\d{1,3}(?:,\\d{3})*(?:\\.\\d{2})?/);
+                   if (m) out.price = m[0];
+                 }
+
+                 // De-dupe
+                 const seen = new Set();
+                 out.images = out.images.filter(u => (u && !seen.has(u) && seen.add(u)));
+                 return out;
+               })();
+             """}
         ]
     }
     try:
         r = requests.post(
             "https://api.firecrawl.dev/v2/scrape",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json=payload, timeout=90
+            json=payload, timeout=95
         )
         if r.status_code >= 400:
             return {}
         return r.json()
     except Exception:
         return {}
+
 
 # ===================== Parsers =====================
 def pick_image_and_price_bs4(html: str, base_url: str) -> Tuple[str, str]:
@@ -878,3 +909,4 @@ with tab3:
         st.write("**Price:**", price or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
