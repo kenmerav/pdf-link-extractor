@@ -1,5 +1,5 @@
 # app.py
-import os, io, time, json, re, requests
+import os, io, json, re, requests, time
 from typing import Optional, Tuple
 import streamlit as st
 import fitz  # PyMuPDF
@@ -10,6 +10,14 @@ from urllib.parse import urljoin
 # ----------------- Streamlit setup -----------------
 st.set_page_config(page_title="Spec Link Extractor & Enricher", layout="wide")
 st.title("🧰 Spec Link Extractor & Enricher")
+
+# --- Progress timer helper ---
+class Timer:
+    def __enter__(self):
+        self.t0 = time.perf_counter()
+        return self
+    def __exit__(self, *exc):
+        self.dt = time.perf_counter() - self.t0
 
 # ----------------- PDF → Links extractor -----------------
 def extract_links_from_pdf(pdf_bytes: bytes) -> pd.DataFrame:
@@ -161,7 +169,6 @@ def firecrawl_scrape_v2(url: str, api_key: str, mode: str = "simple") -> dict:
             json=payload, timeout=75
         )
         if r.status_code >= 400:
-            # You can surface r.text in the UI if you want
             return {}
         return r.json()
     except Exception:
@@ -215,10 +222,7 @@ def parse_image_and_price_from_v2(scrape: dict) -> Tuple[str, str]:
     return img or "", price or ""
 
 def enrich_domain_firecrawl_v2(url: str, api_key: str) -> Tuple[str, str, str]:
-    """
-    Generic Firecrawl v2 enrichment:
-    - simple pass; if any field missing, try gentle (wait/scroll).
-    """
+    """Generic Firecrawl v2 enrichment: simple → gentle if needed."""
     sc = firecrawl_scrape_v2(url, api_key, mode="simple")
     img, price = parse_image_and_price_from_v2(sc)
     status = "firecrawl_v2_simple"
@@ -230,63 +234,11 @@ def enrich_domain_firecrawl_v2(url: str, api_key: str) -> Tuple[str, str, str]:
         status = "firecrawl_v2_gentle" if (i2 or p2) else status
     return img, price, status
 
-# Site-specific wrappers (kept for clarity/future tweaks)
 def enrich_wayfair_v2(url: str, api_key: str) -> Tuple[str, str, str]:
-    # Wayfair generally exposes og:image + JSON-LD price; generic v2 path works well.
     return enrich_domain_firecrawl_v2(url, api_key)
 
 def enrich_ferguson_v2(url: str, api_key: str) -> Tuple[str, str, str]:
-    # Your test showed simple pass worked; we still keep gentle fallback.
     return enrich_domain_firecrawl_v2(url, api_key)
-
-# ----------------- Batch enrich -----------------
-def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str]) -> pd.DataFrame:
-    """Add scraped_image_url and price; Firecrawl v2 first (if key), fallback to bs4."""
-    out = df.copy()
-    if url_col not in out.columns:
-        if len(out.columns) >= 2:
-            url_col = out.columns[1]
-        else:
-            st.error(f"URL column '{url_col}' not found.")
-            return out
-
-    imgs, prices, status = [], [], []
-    api_key = (api_key or "").strip()
-
-    for u in out[url_col].astype(str).fillna(""):
-        u = u.strip()
-        if not u:
-            imgs.append(""); prices.append(""); status.append("no_url"); continue
-
-        img = price = ""; st_code = ""
-
-        # ---- Firecrawl v2 (if key present), with simple domain branches ----
-        if api_key:
-            if "fergusonhome.com" in u:
-                img, price, st_code = enrich_ferguson_v2(u, api_key)
-            elif "wayfair.com" in u:
-                img, price, st_code = enrich_wayfair_v2(u, api_key)
-            else:
-                img, price, st_code = enrich_domain_firecrawl_v2(u, api_key)
-
-        # ---- Fallback: requests + BeautifulSoup ----
-        if not img or not price:
-            r = requests_get(u)
-            if r and r.text:
-                img2, price2 = pick_image_and_price_bs4(r.text, u)
-                img = img or img2
-                price = price or price2
-                st_code = (st_code + "+bs4_ok") if st_code else "bs4_ok"
-            else:
-                st_code = (st_code + "+fetch_failed") if st_code else "fetch_failed"
-
-        imgs.append(img); prices.append(price); status.append(st_code)
-        time.sleep(0.15)  # be polite
-
-    out["scraped_image_url"] = imgs
-    out["price"] = prices
-    out["scrape_status"] = status
-    return out
 
 # ----------------- Sidebar (API key) -----------------
 with st.sidebar:
@@ -305,6 +257,100 @@ tab1, tab2, tab3 = st.tabs([
     "2) Enrich CSV (Image URL + Price)",
     "3) Test single URL"
 ])
+
+# ----------------- Batch enrich -----------------
+def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str]) -> pd.DataFrame:
+    """
+    Add scraped_image_url and price; Firecrawl v2 first (if key), fallback to bs4,
+    with live progress bar + ETA.
+    """
+    out = df.copy()
+    if url_col not in out.columns:
+        if len(out.columns) >= 2:
+            url_col = out.columns[1]
+        else:
+            st.error(f"URL column '{url_col}' not found.")
+            return out
+
+    urls = out[url_col].astype(str).fillna("").tolist()
+
+    # Skip rows that already have both fields (handy for re-runs)
+    if "scraped_image_url" in out.columns and "price" in out.columns:
+        mask_done = out["scraped_image_url"].astype(str).ne("") & out["price"].astype(str).ne("")
+    else:
+        mask_done = pd.Series([False]*len(out))
+
+    idxs = [i for i, done in enumerate(mask_done) if not done]
+
+    # Pre-allocate/retain columns
+    imgs   = out.get("scraped_image_url", pd.Series([""]*len(out))).astype(str).tolist()
+    prices = out.get("price",               pd.Series([""]*len(out))).astype(str).tolist()
+    status = out.get("scrape_status",       pd.Series([""]*len(out))).astype(str).tolist()
+
+    api_key = (api_key or "").strip()
+
+    # UI elements
+    prog = st.progress(0)
+    status_box = st.empty()
+    t_start = time.perf_counter()
+    per_link_times = []
+
+    for k, i in enumerate(idxs, start=1):
+        u = urls[i].strip()
+        if not u:
+            imgs[i] = ""; prices[i] = ""; status[i] = "no_url"
+            prog.progress(k/len(idxs))
+            continue
+
+        with Timer() as t:
+            img = price = ""; st_code = ""
+
+            # ---- Firecrawl v2 (domain-aware) ----
+            if api_key:
+                if "fergusonhome.com" in u:
+                    img, price, st_code = enrich_ferguson_v2(u, api_key)
+                elif "wayfair.com" in u:
+                    img, price, st_code = enrich_wayfair_v2(u, api_key)
+                else:
+                    img, price, st_code = enrich_domain_firecrawl_v2(u, api_key)
+
+            # ---- Fallback: requests + BeautifulSoup ----
+            if not img or not price:
+                r = requests_get(u)
+                if r and r.text:
+                    img2, price2 = pick_image_and_price_bs4(r.text, u)
+                    img = img or img2
+                    price = price or price2
+                    st_code = (st_code + "+bs4_ok") if st_code else "bs4_ok"
+                else:
+                    st_code = (st_code + "+fetch_failed") if st_code else "fetch_failed"
+
+            imgs[i] = img
+            prices[i] = price
+            status[i] = st_code
+
+        # --- Update live metrics ---
+        per_link_times.append(t.dt)
+        avg = sum(per_link_times) / max(len(per_link_times), 1)
+        remaining = (len(idxs) - k) * avg
+        status_box.write(
+            f"Processed {k}/{len(idxs)} • last {t.dt:.2f}s • avg {avg:.2f}s/link • ETA ~{int(remaining)}s"
+        )
+        prog.progress(k/len(idxs))
+
+        # polite pause
+        time.sleep(0.10)
+
+    total = time.perf_counter() - t_start
+    if idxs:
+        status_box.write(f"Done {len(idxs)} link(s) in {total:.1f}s • avg {(total/len(idxs)):.2f}s/link")
+    else:
+        status_box.write("Nothing to do — all rows already enriched.")
+
+    out["scraped_image_url"] = imgs
+    out["price"] = prices
+    out["scrape_status"] = status
+    return out
 
 # --- Tab 1: PDF → Links ---
 with tab1:
