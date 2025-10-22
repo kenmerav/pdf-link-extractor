@@ -1,5 +1,5 @@
 # app.py
-import os, io, json, re, requests, time
+import os, io, json, re, requests, time, random
 from typing import Optional, Tuple
 import streamlit as st
 import fitz  # PyMuPDF
@@ -72,6 +72,12 @@ def canonicalize_url(u: str) -> str:
         return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q), ""))
     except Exception:
         return u
+
+def add_cache_buster(u: str) -> str:
+    p = urlparse(u)
+    q = dict(parse_qsl(p.query, keep_blank_values=True))
+    q["_fcv"] = str(int(time.time()*1000))
+    return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q), ""))
 
 def best_from_srcset(srcset_value: str) -> str:
     best_url, best_w = "", -1
@@ -215,7 +221,7 @@ def firecrawl_scrape_v2(url: str, api_key: str, mode: str = "simple") -> dict:
         "url": url,
         "formats": [
             "html",
-            "markdown",  # useful for Lumens PDP-large
+            "markdown",  # sometimes useful
             {"type": "json", "schema": {
                 "type": "object",
                 "properties": {"price": {"type": "string"}},
@@ -261,21 +267,14 @@ def firecrawl_scrape_v2_aggressive(url: str, api_key: str) -> dict:
         "timeout": 70000,
         "device": "desktop",
         "actions": [
-            # give the page time to boot React
             {"type": "wait", "milliseconds": 1200},
-
-            # scroll in two stages to trigger lazy loads
             {"type": "scroll", "y": 800},
             {"type": "wait", "milliseconds": 1200},
             {"type": "scroll", "y": 1600},
             {"type": "wait", "milliseconds": 1200},
-
-            # wait for any common gallery hooks to exist
             {"type": "waitForSelector",
              "selector": "[data-enlarged], img[data-enlarged], [data-testid*='ImageCarousel'], [class*='ImageCarousel'], picture source[srcset], img[srcset], img[data-src], img[data-srcset]",
              "timeout": 10000},
-
-            # nudge: hover over a likely gallery/hero image so some sites attach hi-res on hover
             {"type": "evaluate",
              "script": """
                (()=>{
@@ -287,10 +286,7 @@ def firecrawl_scrape_v2_aggressive(url: str, api_key: str) -> dict:
                  }
                })();
              """},
-
             {"type": "wait", "milliseconds": 900},
-
-            # harvest: collect images from meta, JSON-LD, <picture>/<img> (incl. lazy/srcset), and find a price
             {"type": "evaluate",
              "script": """
                (() => {
@@ -309,16 +305,10 @@ def firecrawl_scrape_v2_aggressive(url: str, api_key: str) -> dict:
                    });
                    return best[0];
                  }
-
                  const out = { images: [], price: "" };
-
-                 // Meta (OG/Twitter)
                  document.querySelectorAll('meta[property="og:image"],meta[name="og:image"],meta[property="og:image:url"],meta[property="og:image:secure_url"],meta[name="twitter:image"]').forEach(m => {
-                   const v = m.getAttribute("content");
-                   if (v) out.images.push(v);
+                   const v = m.getAttribute("content"); if (v) out.images.push(v);
                  });
-
-                 // JSON-LD Product
                  document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
                    try {
                      const data = JSON.parse(s.textContent || "null");
@@ -338,14 +328,10 @@ def firecrawl_scrape_v2_aggressive(url: str, api_key: str) -> dict:
                      });
                    } catch {}
                  });
-
-                 // <picture> with srcset
                  document.querySelectorAll("picture source[srcset], source[srcset]").forEach(src => {
                    const best = bestFromSrcset(src.getAttribute("srcset"));
                    if (best) out.images.push(best);
                  });
-
-                 // <img> (lazy + srcset variants)
                  document.querySelectorAll("img").forEach(img => {
                    let cand = img.getAttribute("data-enlarged") || img.getAttribute("src") || img.getAttribute("data-src") || "";
                    if (!cand) {
@@ -355,14 +341,10 @@ def firecrawl_scrape_v2_aggressive(url: str, api_key: str) -> dict:
                    cand = cand || img.getAttribute("data-zoom-image") || img.getAttribute("data-large_image") || "";
                    if (cand) out.images.push(cand);
                  });
-
-                 // Visible price fallback
                  if (!out.price) {
                    const m = (document.body.innerText || "").match(/\\$\\s?\\d{1,3}(?:,\\d{3})*(?:\\.\\d{2})?/);
                    if (m) out.price = m[0];
                  }
-
-                 // De-dupe
                  const seen = new Set();
                  out.images = out.images.filter(u => (u && !seen.has(u) && seen.add(u)));
                  return out;
@@ -381,7 +363,6 @@ def firecrawl_scrape_v2_aggressive(url: str, api_key: str) -> dict:
         return r.json()
     except Exception:
         return {}
-
 
 # ===================== Parsers =====================
 def pick_image_and_price_bs4(html: str, base_url: str) -> Tuple[str, str]:
@@ -517,6 +498,49 @@ def parse_image_and_price_lumens_from_v2(scrape: dict) -> Tuple[str, str]:
             if m: price = m.group(0)
     return img or "", price or ""
 
+# ----- Wayfair: Next.js fallback -----
+def parse_wayfair_next_data(html: str) -> Tuple[str, str]:
+    """Extract hero image + price from Wayfair's Next.js data if present."""
+    if not html:
+        return "", ""
+    soup = BeautifulSoup(html, "lxml")
+    tag = soup.find("script", id="__NEXT_DATA__", type="application/json")
+    if not tag or not tag.string:
+        return "", ""
+    try:
+        data = json.loads(tag.string)
+    except Exception:
+        return "", ""
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            # image candidates
+            for k in ("imageUrl", "imageURL", "image", "url", "src", "srcLarge", "zoomUrl", "galleryImageUrl"):
+                v = obj.get(k)
+                if isinstance(v, str) and v.startswith(("http://", "https://")):
+                    yield ("image", v)
+            # price candidates
+            for k in ("price", "salePrice", "currentPrice", "displayPrice", "minPrice"):
+                v = obj.get(k)
+                if isinstance(v, (str, int, float)):
+                    yield ("price", str(v))
+            for v in obj.values():
+                yield from walk(v)
+        elif isinstance(obj, list):
+            for it in obj:
+                yield from walk(it)
+
+    img, price = "", ""
+    for kind, val in walk(data):
+        if kind == "image" and not img:
+            img = val
+        elif kind == "price" and not price:
+            m = PRICE_RE.search(val.replace("USD", "$"))
+            price = m.group(0) if m else price or val
+        if img and price:
+            break
+    return img, price
+
 # ----- Wayfair specific -----
 def parse_image_and_price_wayfair_v2(scrape: dict) -> Tuple[str, str]:
     if not scrape: return "", ""
@@ -525,6 +549,8 @@ def parse_image_and_price_wayfair_v2(scrape: dict) -> Tuple[str, str]:
     meta = data.get("metadata") or {}
     img = ""; price = ""
     soup = BeautifulSoup(html or "", "lxml") if html else None
+
+    # 1) JSON-LD Product
     if soup:
         for tag in soup.find_all("script", type="application/ld+json"):
             try:
@@ -545,8 +571,16 @@ def parse_image_and_price_wayfair_v2(scrape: dict) -> Tuple[str, str]:
                     if p and not price:
                         price = p if str(p).startswith("$") else f"${p}"
             if img and price: break
+
+    # 1.5) NEW: Next.js blob fallback
+    if (not img or not price) and html:
+        i_nx, p_nx = parse_wayfair_next_data(html)
+        if i_nx and not img: img = i_nx
+        if p_nx and not price: price = p_nx
+
+    # 2) Gallery lazy attrs / srcset
     if not img and soup:
-        gallery = soup.select_one('[data-enlarged], [data-testid*="gallery"], [class*="ImageCarousel"], [class*="Gallery"]') or soup
+        gallery = soup.select_one('[data-enlarged], [data-testid*="ImageCarousel"], [class*="ImageCarousel"], [class*="Gallery"]') or soup
         cands = []
         for imgtag in gallery.find_all("img"):
             cand = imgtag.get("data-enlarged") or imgtag.get("data-src") or imgtag.get("src")
@@ -573,8 +607,12 @@ def parse_image_and_price_wayfair_v2(scrape: dict) -> Tuple[str, str]:
         if cands:
             cands.sort(key=lambda x: x[0], reverse=True)
             img = cands[0][1]
+
+    # 3) OG/Twitter last resort
     if not img:
         img = meta.get("og:image") or meta.get("twitter:image") or meta.get("image") or ""
+
+    # 4) Price fallback
     if not price and soup:
         m = PRICE_RE.search(soup.get_text(" ", strip=True))
         if m: price = m.group(0)
@@ -630,23 +668,14 @@ def parse_image_and_price_crate_cb2_v2(scrape: dict) -> Tuple[str, str]:
     return img or "", price or ""
 
 # ===================== Domain enrichers (use Firecrawl then fallback) =====================
-def enrich_domain_firecrawl_v2(url: str, api_key: str) -> Tuple[str, str, str]:
-    sc = firecrawl_scrape_v2(url, api_key, mode="simple")
-    img, price = parse_image_and_price_wayfair_v2(sc) if "wayfair.com" in url.lower() else parse_image_and_price_crate_cb2_v2(sc)
-    if img or price:
-        return img, price, "firecrawl_v2_simple"
-    sc2 = firecrawl_scrape_v2(url, api_key, mode="gentle")
-    i2, p2 = (parse_image_and_price_wayfair_v2(sc2) if "wayfair.com" in url.lower() else parse_image_and_price_crate_cb2_v2(sc2))
-    if i2 or p2:
-        return i2, p2, "firecrawl_v2_gentle"
-    return "", "", "firecrawl_v2_fail"
-
 def enrich_wayfair_v2(url: str, api_key: str) -> Tuple[str, str, str]:
-    sc = firecrawl_scrape_v2_aggressive(url, api_key)
+    # cache-buster helps avoid stale/light variants
+    busted = add_cache_buster(url)
+    sc = firecrawl_scrape_v2_aggressive(busted, api_key)
     i1, p1 = parse_image_and_price_wayfair_v2(sc)
     if i1 or p1:
         return i1, p1, "firecrawl_v2_aggressive"
-    sc2 = firecrawl_scrape_v2(url, api_key, mode="gentle")
+    sc2 = firecrawl_scrape_v2(busted, api_key, mode="gentle")
     i2, p2 = parse_image_and_price_wayfair_v2(sc2)
     return i2, p2, ("firecrawl_v2_gentle" if (i2 or p2) else "firecrawl_v2_fail")
 
@@ -661,11 +690,12 @@ def enrich_crate_cb2_v2(url: str, api_key: str) -> Tuple[str, str, str]:
 
 def enrich_ferguson_v2(url: str, api_key: str) -> Tuple[str, str, str]:
     sc = firecrawl_scrape_v2(url, api_key, mode="simple")
-    img, price = parse_image_and_price_wayfair_v2(sc)  # generic JSON-LD/OG parse works fine
-    if img or price:
-        return img, price, "firecrawl_v2_simple"
+    # generic parse works OK
+    i1, p1 = pick_image_and_price_bs4(sc.get("data", {}).get("html", "") or "", url)
+    if i1 or p1:
+        return i1, p1, "firecrawl_v2_simple"
     sc2 = firecrawl_scrape_v2(url, api_key, mode="gentle")
-    i2, p2 = parse_image_and_price_wayfair_v2(sc2)
+    i2, p2 = pick_image_and_price_bs4(sc2.get("data", {}).get("html", "") or "", url)
     return i2, p2, ("firecrawl_v2_gentle" if (i2 or p2) else "firecrawl_v2_fail")
 
 def enrich_lumens_v2(url: str, api_key: str) -> Tuple[str, str, str]:
@@ -679,10 +709,18 @@ def enrich_lumens_v2(url: str, api_key: str) -> Tuple[str, str, str]:
         img = img or i2
         price = price or p2
         status = "firecrawl_v2_gentle" if (i2 or p2) else status
-    # upgrade Scene7 if applicable
     if img and ("images.lumens.com/is/image" in img or "/is/image/" in img):
         img = lumens_upgrade_scene7_url(img)
     return img, price, status
+
+def enrich_domain_firecrawl_v2(url: str, api_key: str) -> Tuple[str, str, str]:
+    sc = firecrawl_scrape_v2_aggressive(url, api_key)
+    i1, p1 = pick_image_and_price_bs4(sc.get("data", {}).get("html", "") or "", url)
+    if i1 or p1:
+        return i1, p1, "firecrawl_v2_aggressive"
+    sc2 = firecrawl_scrape_v2(url, api_key, mode="gentle")
+    i2, p2 = pick_image_and_price_bs4(sc2.get("data", {}).get("html", "") or "", url)
+    return i2, p2, ("firecrawl_v2_gentle" if (i2 or p2) else "firecrawl_v2_fail")
 
 # ===================== Sidebar (API key) =====================
 with st.sidebar:
@@ -757,16 +795,7 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str]) -> pd.Da
                 elif "fergusonhome.com" in low:
                     img, price, st_code = enrich_ferguson_v2(u, api_key)
                 else:
-                    # generic pass (try aggressive first, then gentle)
-                    sc = firecrawl_scrape_v2_aggressive(u, api_key)
-                    i1, p1 = parse_image_and_price_wayfair_v2(sc)  # generic JSON-LD/OG parse
-                    if not (i1 or p1):
-                        sc2 = firecrawl_scrape_v2(u, api_key, mode="gentle")
-                        i1, p1 = parse_image_and_price_wayfair_v2(sc2)
-                        st_code = "firecrawl_v2_gentle" if (i1 or p1) else "firecrawl_v2_fail"
-                    else:
-                        st_code = "firecrawl_v2_aggressive"
-                    img, price = i1, p1
+                    img, price, st_code = enrich_domain_firecrawl_v2(u, api_key)
 
             # ---- Fallback: requests + BeautifulSoup ----
             if not img or not price:
@@ -797,7 +826,9 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str]) -> pd.Da
             f"Processed {k}/{len(idxs)} • last {t.dt:.2f}s • avg {avg:.2f}s/link • ETA ~{int(remaining)}s"
         )
         prog.progress(k/len(idxs))
-        time.sleep(0.10)
+
+        # polite anti-throttle jitter
+        time.sleep(0.30 + 0.50*random.random())
 
     total = time.perf_counter() - t_start
     if idxs:
@@ -868,7 +899,7 @@ with tab3:
     st.caption("Paste a single product URL and test the enrichment (domain-aware Firecrawl, then fallback).")
     test_url = st.text_input(
         "Product URL to test",
-        "https://www.lumens.com/vishal-chandelier-by-troy-lighting-TRY2622687.html"
+        "https://www.wayfair.com/furniture/pdp/example"
     )
 
     if st.button("Run test", key="single_test_btn"):
@@ -909,4 +940,3 @@ with tab3:
         st.write("**Price:**", price or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
-
