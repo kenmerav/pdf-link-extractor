@@ -1,11 +1,18 @@
+# app.py
 import os, io, time, json, re, requests
+from typing import Optional, Tuple
 import streamlit as st
 import fitz  # PyMuPDF
 import pandas as pd
+from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
-# ---------- Your original: Extract links from PDF ----------
-def extract_links_from_pdf(pdf_bytes):
+# ----------------- Streamlit setup -----------------
+st.set_page_config(page_title="Spec Link Extractor & Enricher", layout="wide")
+st.title("🧰 Spec Link Extractor & Enricher")
+
+# ----------------- PDF → Links extractor -----------------
+def extract_links_from_pdf(pdf_bytes: bytes) -> pd.DataFrame:
     """Extract links + metadata from uploaded PDF file (bytes)."""
     doc = fitz.open("pdf", pdf_bytes)
     rows = []
@@ -24,24 +31,21 @@ def extract_links_from_pdf(pdf_bytes):
             uri = lnk.get('uri') or ''
             if not uri.startswith(('http://', 'https://')):
                 continue
-
             rect = fitz.Rect(lnk['from'])
             link_title = page.get_textbox(rect).strip() or ''
-
             rows.append({
                 'Product Name': link_title,
                 'Product URL': uri,
                 'project': project,
                 'sheet': sheet
             })
-
     return pd.DataFrame(rows)
 
-# ---------- Enricher: Firecrawl (optional) + BeautifulSoup ----------
+# ----------------- Common helpers -----------------
 PRICE_RE = re.compile(r"\$\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?")  # $1,234.56
 UA = {"User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
 
-def requests_get(url, timeout=20, retries=2):
+def requests_get(url: str, timeout: int = 20, retries: int = 2) -> Optional[requests.Response]:
     for _ in range(retries+1):
         try:
             r = requests.get(url, headers=UA, timeout=timeout)
@@ -52,17 +56,19 @@ def requests_get(url, timeout=20, retries=2):
         time.sleep(0.25)
     return None
 
-def pick_image_and_price_bs4(html: str, base_url: str):
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html, "lxml")
+def pick_image_and_price_bs4(html: str, base_url: str) -> Tuple[str, str]:
+    """Lightweight fallback: og/twitter → JSON-LD → meta → visible $ pattern."""
+    soup = BeautifulSoup(html or "", "lxml")
 
-    # image via og/twitter/json-ld/fallback
+    # Image: og/twitter first
     img_url = ""
     for sel in [("meta", {"property":"og:image"}), ("meta", {"name":"og:image"}),
                 ("meta", {"name":"twitter:image"}), ("meta", {"property":"twitter:image"})]:
         tag = soup.find(*sel)
         if tag and tag.get("content"):
             img_url = urljoin(base_url, tag["content"]); break
+
+    # Image: JSON-LD Product.image
     if not img_url:
         for tag in soup.find_all("script", type="application/ld+json"):
             try:
@@ -72,16 +78,20 @@ def pick_image_and_price_bs4(html: str, base_url: str):
                     t = obj.get("@type")
                     if t == "Product" or (isinstance(t, list) and "Product" in t):
                         im = obj.get("image")
-                        if isinstance(im, list) and im: img_url = urljoin(base_url, im[0]); break
-                        if isinstance(im, str) and im:  img_url = urljoin(base_url, im); break
+                        if isinstance(im, list) and im:
+                            img_url = urljoin(base_url, im[0]); break
+                        if isinstance(im, str) and im:
+                            img_url = urljoin(base_url, im); break
                 if img_url: break
             except Exception:
                 pass
+
+    # Last-resort image: first <img>
     if not img_url:
         anyimg = soup.find("img", src=True)
         if anyimg: img_url = urljoin(base_url, anyimg["src"])
 
-    # price via JSON-LD, meta, or visible text
+    # Price: JSON-LD offers.price
     price = ""
     for tag in soup.find_all("script", type="application/ld+json"):
         try:
@@ -91,8 +101,7 @@ def pick_image_and_price_bs4(html: str, base_url: str):
                 t = obj.get("@type")
                 if t == "Product" or (isinstance(t, list) and "Product" in t):
                     offers = obj.get("offers") or {}
-                    if isinstance(offers, list):
-                        offers = offers[0] if offers else {}
+                    if isinstance(offers, list): offers = offers[0] if offers else {}
                     val = offers.get("price") or (offers.get("priceSpecification") or {}).get("price")
                     if val:
                         price = f"${val}" if not str(val).startswith("$") else str(val)
@@ -100,73 +109,141 @@ def pick_image_and_price_bs4(html: str, base_url: str):
             if price: break
         except Exception:
             pass
+
+    # Price: meta itemprop/property
     if not price:
-        meta_price = soup.find("meta", attrs={"itemprop":"price"}) or soup.find("meta", attrs={"property":"product:price:amount"})
+        meta_price = soup.find("meta", attrs={"itemprop":"price"}) or \
+                     soup.find("meta", attrs={"property":"product:price:amount"})
         if meta_price and meta_price.get("content"):
             val = meta_price["content"]
             price = f"${val}" if not str(val).startswith("$") else str(val)
+
+    # Price: visible pattern
     if not price:
         m = PRICE_RE.search(soup.get_text(" ", strip=True))
         if m: price = m.group(0)
 
     return img_url or "", price or ""
 
-def firecrawl_client(api_key: str):
-    if not api_key: return None
+# ----------------- Firecrawl v2 (REST) helpers -----------------
+def firecrawl_scrape_v2(url: str, api_key: str, mode: str = "simple") -> dict:
+    """
+    Call Firecrawl /v2/scrape via REST.
+    - returns dict (may include data.metadata, data.html, data.json)
+    - mode 'simple' (no actions) or 'gentle' (wait/scroll)
+    """
+    if not api_key:
+        return {}
+    payload = {
+        "url": url,
+        "formats": [
+            "html",  # includes metadata (og:image)
+            { "type": "json", "schema": {
+                "type": "object",
+                "properties": { "price": { "type": "string" } },
+                "required": []
+            }}
+        ],
+        "proxy": "auto",
+        "timeout": 45000,
+    }
+    if mode == "gentle":
+        payload["actions"] = [
+            {"type": "wait", "milliseconds": 800},
+            {"type": "scroll", "y": 1200},
+            {"type": "wait", "milliseconds": 1200},
+        ]
+
     try:
-        from firecrawl import Firecrawl
-        return Firecrawl(api_key=api_key)
+        r = requests.post(
+            "https://api.firecrawl.dev/v2/scrape",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload, timeout=75
+        )
+        if r.status_code >= 400:
+            # You can surface r.text in the UI if you want
+            return {}
+        return r.json()
     except Exception:
-        return None
+        return {}
 
-def pick_image_from_firecrawl(sc: dict) -> str:
-    if not sc: return ""
-    meta = sc.get("metadata") or {}
-    for k in ("og:image","twitter:image","image"):
-        v = meta.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    for block in sc.get("data") or []:
-        if block.get("type") == "json-ld":
-            try:
-                data = json.loads(block.get("content") or "{}")
-                objs = data if isinstance(data, list) else [data]
-                for obj in objs:
-                    t = obj.get("@type")
-                    if t == "Product" or (isinstance(t, list) and "Product" in t):
-                        img = obj.get("image")
-                        if isinstance(img, list) and img: return img[0]
-                        if isinstance(img, str) and img.strip(): return img.strip()
-            except Exception:
-                pass
-    imgs = sc.get("images") or []
-    if imgs: return imgs[0]
-    return ""
+def parse_image_and_price_from_v2(scrape: dict) -> Tuple[str, str]:
+    """Pull og:image + price from a /v2/scrape response."""
+    if not scrape: return "", ""
+    data = scrape.get("data") or {}
+    meta = data.get("metadata") or {}
+    img = meta.get("og:image") or meta.get("twitter:image") or meta.get("image") or ""
 
-def firecrawl_extract_price(fc, url: str) -> str:
-    try:
-        schema = {
-            "type":"object",
-            "properties":{"price":{"type":"string","description":"Product price with currency symbol if shown"}},
-            "required":[]
-        }
-        res = fc.extract({"urls":[url], "schema":schema, "render":True})
-        item = (res.get("data") or [{}])[0].get("content") or {}
-        price = (item.get("price") or "").strip()
-        if price and not PRICE_RE.search(price):
-            # normalize "USD 199" etc.
-            m = PRICE_RE.search(price.replace("USD","$").replace("usd","$"))
-            if m: price = m.group(0)
-        return price
-    except Exception:
-        return ""
+    # Try Firecrawl's JSON content first
+    price = ""
+    j = data.get("json")
+    if isinstance(j, dict):
+        content = j.get("content") if isinstance(j.get("content"), dict) else j
+        if isinstance(content, dict):
+            price = (content.get("price") or "").strip()
 
-def enrich_urls(df: pd.DataFrame, url_col: str, api_key: str | None) -> pd.DataFrame:
-    """Add scraped_image_url and price; Firecrawl first (if api_key), fallback to bs4."""
-    fc = firecrawl_client(api_key)
+    # Fallback: JSON-LD in HTML
+    if not price or not img:
+        html = data.get("html") or ""
+        soup = BeautifulSoup(html or "", "lxml")
+        if not price:
+            for tag in soup.find_all("script", type="application/ld+json"):
+                try:
+                    obj = json.loads(tag.string or "")
+                    objs = obj if isinstance(obj, list) else [obj]
+                    for o in objs:
+                        t = o.get("@type")
+                        if t == "Product" or (isinstance(t, list) and "Product" in t):
+                            offers = o.get("offers") or {}
+                            if isinstance(offers, list): offers = offers[0] if offers else {}
+                            p = offers.get("price") or (offers.get("priceSpecification") or {}).get("price")
+                            if p:
+                                price = p if str(p).startswith("$") else f"${p}"
+                except Exception:
+                    pass
+        if not img:
+            m = soup.find("meta", attrs={"property":"og:image"}) or \
+                soup.find("meta", attrs={"name":"og:image"})
+            if m and m.get("content"):
+                img = m["content"]
+
+    # Final price fallback: visible $
+    if not price and (data.get("html") or ""):
+        m = PRICE_RE.search(BeautifulSoup(data.get("html"), "lxml").get_text(" ", strip=True))
+        if m: price = m.group(0)
+
+    return img or "", price or ""
+
+def enrich_domain_firecrawl_v2(url: str, api_key: str) -> Tuple[str, str, str]:
+    """
+    Generic Firecrawl v2 enrichment:
+    - simple pass; if any field missing, try gentle (wait/scroll).
+    """
+    sc = firecrawl_scrape_v2(url, api_key, mode="simple")
+    img, price = parse_image_and_price_from_v2(sc)
+    status = "firecrawl_v2_simple"
+    if not img or not price:
+        sc2 = firecrawl_scrape_v2(url, api_key, mode="gentle")
+        i2, p2 = parse_image_and_price_from_v2(sc2)
+        img = img or i2
+        price = price or p2
+        status = "firecrawl_v2_gentle" if (i2 or p2) else status
+    return img, price, status
+
+# Site-specific wrappers (kept for clarity/future tweaks)
+def enrich_wayfair_v2(url: str, api_key: str) -> Tuple[str, str, str]:
+    # Wayfair generally exposes og:image + JSON-LD price; generic v2 path works well.
+    return enrich_domain_firecrawl_v2(url, api_key)
+
+def enrich_ferguson_v2(url: str, api_key: str) -> Tuple[str, str, str]:
+    # Your test showed simple pass worked; we still keep gentle fallback.
+    return enrich_domain_firecrawl_v2(url, api_key)
+
+# ----------------- Batch enrich -----------------
+def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str]) -> pd.DataFrame:
+    """Add scraped_image_url and price; Firecrawl v2 first (if key), fallback to bs4."""
     out = df.copy()
     if url_col not in out.columns:
-        # try second column as fallback
         if len(out.columns) >= 2:
             url_col = out.columns[1]
         else:
@@ -174,6 +251,7 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: str | None) -> pd.DataF
             return out
 
     imgs, prices, status = [], [], []
+    api_key = (api_key or "").strip()
 
     for u in out[url_col].astype(str).fillna(""):
         u = u.strip()
@@ -182,17 +260,16 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: str | None) -> pd.DataF
 
         img = price = ""; st_code = ""
 
-        # Firecrawl first (if configured)
-        if fc:
-            try:
-                sc = fc.scrape_url(u, params={"formats":["json","html","markdown"], "render": True, "timeout": 25000})
-                img = pick_image_from_firecrawl(sc)
-                price = firecrawl_extract_price(fc, u)
-                st_code = "firecrawl_ok"
-            except Exception:
-                st_code = "firecrawl_fail"
+        # ---- Firecrawl v2 (if key present), with simple domain branches ----
+        if api_key:
+            if "fergusonhome.com" in u:
+                img, price, st_code = enrich_ferguson_v2(u, api_key)
+            elif "wayfair.com" in u:
+                img, price, st_code = enrich_wayfair_v2(u, api_key)
+            else:
+                img, price, st_code = enrich_domain_firecrawl_v2(u, api_key)
 
-        # Fallback to requests+bs4
+        # ---- Fallback: requests + BeautifulSoup ----
         if not img or not price:
             r = requests_get(u)
             if r and r.text:
@@ -204,25 +281,32 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: str | None) -> pd.DataF
                 st_code = (st_code + "+fetch_failed") if st_code else "fetch_failed"
 
         imgs.append(img); prices.append(price); status.append(st_code)
-        time.sleep(0.2)
+        time.sleep(0.15)  # be polite
 
     out["scraped_image_url"] = imgs
     out["price"] = prices
     out["scrape_status"] = status
     return out
 
-# ----------------- Streamlit UI -----------------
-st.set_page_config(page_title="Spec Link Extractor & Enricher", layout="wide")
-st.title("🧰 Spec Link Extractor & Enricher")
-
+# ----------------- Sidebar (API key) -----------------
 with st.sidebar:
     st.subheader("Firecrawl (optional)")
-    api_key = st.text_input("FIRECRAWL_API_KEY", value=os.getenv("FIRECRAWL_API_KEY", ""), type="password")
-    st.caption("Leave blank to use the built-in parser only (no credits used).")
+    api_key_input = st.text_input(
+        "FIRECRAWL_API_KEY",
+        value=os.getenv("FIRECRAWL_API_KEY", ""),
+        type="password",
+        help="Leave blank to use the built-in parser only (no credits used)."
+    )
+    st.caption("Tip: In Streamlit Cloud, put this in **Settings → Secrets**.")
 
-tab1, tab2 = st.tabs(["1) Extract links from PDF", "2) Enrich links (Image URL + Price)"])
+# ----------------- Tabs -----------------
+tab1, tab2, tab3 = st.tabs([
+    "1) Extract from PDF",
+    "2) Enrich CSV (Image URL + Price)",
+    "3) Test single URL"
+])
 
-# --- Tab 1: Extract links from PDF ---
+# --- Tab 1: PDF → Links ---
 with tab1:
     st.caption("Upload a PDF → extract all web links with project/sheet info → download a CSV.")
     uploaded_pdf = st.file_uploader("Upload a PDF", type="pdf", key="pdf_uploader")
@@ -239,7 +323,6 @@ with tab1:
             else:
                 st.success("Done! ✅")
                 st.dataframe(result_df, use_container_width=True)
-
                 csv_bytes = result_df.to_csv(index=False).encode("utf-8")
                 st.download_button(
                     "Download results CSV",
@@ -248,7 +331,7 @@ with tab1:
                     mime="text/csv",
                 )
 
-# --- Tab 2: Enrich links (from a CSV OR from Tab 1 output you re-upload) ---
+# --- Tab 2: Enrich CSV ---
 with tab2:
     st.caption("Provide a CSV with a 'Product URL' column (or the 2nd column will be used).")
     csv_file = st.file_uploader("Upload links CSV", type=["csv"], key="csv_uploader")
@@ -267,11 +350,10 @@ with tab2:
 
             if st.button("Enrich (Image URL + Price)", key="enrich_btn"):
                 with st.spinner("Scraping image + price..."):
-                    df_out = enrich_urls(df_in, url_col, api_key.strip())
+                    df_out = enrich_urls(df_in, url_col, api_key_input)
                 st.success("Enriched! ✅")
                 st.dataframe(df_out, use_container_width=True)
                 st.caption(df_out["scrape_status"].value_counts(dropna=False).to_frame("count"))
-
                 out_csv = df_out.to_csv(index=False).encode("utf-8")
                 st.download_button(
                     "Download enriched CSV",
@@ -279,5 +361,36 @@ with tab2:
                     file_name="links_enriched.csv",
                     mime="text/csv",
                 )
-    else:
-        st.info("Upload a CSV to enrich. (Tip: Use the CSV you downloaded from Tab 1.)")
+
+# --- Tab 3: Test a single URL ---
+with tab3:
+    st.caption("Paste a single product URL and test the enrichment (Firecrawl v2 first, then fallback).")
+    test_url = st.text_input("Product URL to test", "https://www.fergusonhome.com/product/summary/1871316?uid=4421090")
+
+    if st.button("Run test", key="single_test_btn"):
+        img = price = ""; status = ""
+        # Firecrawl v2 routes if key is present
+        if api_key_input:
+            if "fergusonhome.com" in test_url:
+                img, price, status = enrich_ferguson_v2(test_url, api_key_input)
+            elif "wayfair.com" in test_url:
+                img, price, status = enrich_wayfair_v2(test_url, api_key_input)
+            else:
+                img, price, status = enrich_domain_firecrawl_v2(test_url, api_key_input)
+
+        # Fallback if needed
+        if not img or not price:
+            r = requests_get(test_url)
+            if r and r.text:
+                i2, p2 = pick_image_and_price_bs4(r.text, test_url)
+                img = img or i2
+                price = price or p2
+                status = (status + "+bs4_ok") if status else "bs4_ok"
+            else:
+                status = (status + "+fetch_failed") if status else "fetch_failed"
+
+        st.write("**Status:**", status or "unknown")
+        st.write("**Image URL:**", img or "—")
+        st.write("**Price:**", price or "—")
+        if img:
+            st.image(img, caption="Preview", use_container_width=True)
