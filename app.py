@@ -337,19 +337,14 @@ def parse_image_and_price_lumens(scrape: dict) -> Tuple[str, str]:
 
     # 2) <picture><source srcset="..."> (common on Lumens PDP)
     if not img:
-        # Prefer a hero/pdp area if present
         scope = soup.select_one('[class*="pdp"], [id*="pdp"], [class*="gallery"], [id*="gallery"]') or soup
         best_pic = None
         best_score = -1
         for pict in scope.find_all("picture"):
-            # score pictures with product/hero-ish classes
-            s = " ".join(
-                [str(x) for x in (pict.get("class") or []) + [pict.get("id") or ""]]
-            ).lower()
+            s = " ".join([str(x) for x in (pict.get("class") or []) + [pict.get("id") or ""]]).lower()
             score = 0
             if any(k in s for k in ("product", "hero", "main", "primary", "gallery", "pdp")):
                 score += 5
-            # prefer pictures that have a wide srcset candidate
             cand_url = best_from_picture(pict)
             if cand_url:
                 score += 3
@@ -371,7 +366,6 @@ def parse_image_and_price_lumens(scrape: dict) -> Tuple[str, str]:
                 ss = imgtag.get("srcset") or imgtag.get("data-srcset")
                 if ss:
                     cand = best_from_srcset(ss)
-            # some sites use custom attrs:
             cand = cand or imgtag.get("data-zoom-image") or imgtag.get("data-large_image")
             if cand:
                 score = 0
@@ -382,7 +376,7 @@ def parse_image_and_price_lumens(scrape: dict) -> Tuple[str, str]:
                     score += 3
                 try:
                     w = int(imgtag.get("width") or 0)
-                    if w >= 600: 
+                    if w >= 600:
                         score += 2
                 except Exception:
                     pass
@@ -436,44 +430,6 @@ def parse_image_and_price_lumens(scrape: dict) -> Tuple[str, str]:
         m = PRICE_RE.search(t)
         if m:
             price = m.group(0)
-
-    return (img or ""), (price or "")
-
-    # --- PRICE ---
-    price = ""
-    j = data.get("json")
-    if isinstance(j, dict):
-        content = j.get("content") if isinstance(j.get("content"), dict) else j
-        if isinstance(content, dict):
-            price = (content.get("price") or "").strip()
-
-    if not price:
-        for tag in soup.find_all("script", type="application/ld+json"):
-            try:
-                obj = json.loads(tag.string or "")
-                objs = obj if isinstance(obj, list) else [obj]
-                for o in objs:
-                    t = o.get("@type")
-                    if t == "Product" or (isinstance(t, list) and "Product" in t):
-                        offers = o.get("offers") or {}
-                        if isinstance(offers, list): offers = offers[0] if offers else {}
-                        p = offers.get("price") or (offers.get("priceSpecification") or {}).get("price")
-                        if p:
-                            price = p if str(p).startswith("$") else f"${p}"
-                            break
-                if price: break
-            except Exception:
-                pass
-
-    if not price:
-        m = soup.find("meta", attrs={"itemprop": "price"}) or soup.find("meta", attrs={"property": "product:price:amount"})
-        if m and m.get("content"):
-            val = m["content"]
-            price = val if str(val).startswith("$") else f"${val}"
-    if not price:
-        t = soup.get_text(" ", strip=True)
-        m = PRICE_RE.search(t)
-        if m: price = m.group(0)
 
     return (img or ""), (price or "")
 
@@ -694,4 +650,5 @@ with tab3:
         st.write("**Price:**", price or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
 
