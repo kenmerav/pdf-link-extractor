@@ -6,6 +6,9 @@ import fitz  # PyMuPDF
 import pandas as pd
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode
+from PIL import Image, ImageFile
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # ===================== Streamlit setup =====================
 st.set_page_config(page_title="Spec Link Extractor & Enricher", layout="wide")
@@ -116,7 +119,7 @@ def best_from_picture(picture_tag) -> str:
                 best_w, best_url = w, url
     return best_url
 
-# ---------- Scene7 (Lumens) upgrader ----------
+# ---------- Scene7 (Lumens) upgrader (Pillow-measured) ----------
 def _update_query(url: str, add: dict, remove_keys: tuple = ()) -> str:
     p = urlparse(url)
     q = dict(parse_qsl(p.query, keep_blank_values=True))
@@ -125,20 +128,50 @@ def _update_query(url: str, add: dict, remove_keys: tuple = ()) -> str:
     q.update({k: str(v) for k, v in add.items()})
     return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q), ""))
 
-def _head_size(url: str, timeout: int = 10) -> tuple[int, str]:
+def _strip_scene7_preset(url: str) -> str:
+    """Remove any $...$ preset in the query part (Scene7 style)."""
+    if "?" not in url:
+        return url
+    path, q = url.split("?", 1)
+    q = q.strip()
+    if q.startswith("$") and q.endswith("$"):
+        return path  # pure preset → drop
+    if "$" in q:
+        parts = [p for p in q.split("&") if not (p.startswith("$") and p.endswith("$"))]
+        q = "&".join(parts)
+        return f"{path}?{q}" if q else path
+    return url
+
+def _measure_image_dims(url: str, timeout: int = 12) -> tuple[int, int]:
+    """Return (width, height) by streaming enough bytes for Pillow to parse; fallback (0,0)."""
     try:
-        r = requests.head(url, headers=UA, allow_redirects=True, timeout=timeout)
-        if r.status_code >= 400:
-            r = requests.get(url, headers=UA, stream=True, allow_redirects=True, timeout=timeout)
-            if r.status_code >= 400:
-                return -1, url
-        length = int(r.headers.get("Content-Length") or -1)
-        return length, r.url
+        r = requests.get(url, headers=UA, stream=True, timeout=timeout)
+        r.raise_for_status()
+        bio = io.BytesIO()
+        for chunk in r.iter_content(8192):
+            if not chunk:
+                break
+            bio.write(chunk)
+            try:
+                bio.seek(0)
+                with Image.open(bio) as im:
+                    im.load()
+                    return im.size  # (w,h)
+            except Exception:
+                if bio.tell() > 5 * 1024 * 1024:  # ~5MB cap
+                    break
+        bio.seek(0)
+        with Image.open(bio) as im:
+            im.load()
+            return im.size
     except Exception:
-        return -1, url
+        return (0, 0)
 
 def lumens_upgrade_scene7_url(url: str) -> str:
-    """Probe zoom/preset/wide variants and pick the largest working Scene7 image."""
+    """
+    If this is a Lumens/Scene7 URL, try many higher-res candidates and
+    pick the one with the largest actual pixel width (Pillow-measured).
+    """
     if not isinstance(url, str) or "is/image" not in url:
         return url
     host = urlparse(url).netloc.lower()
@@ -146,39 +179,49 @@ def lumens_upgrade_scene7_url(url: str) -> str:
         return url
 
     candidates = [url]
-    if "$" in url:
-        candidates.extend([
-            url.replace("$Lumens.com-PDP-large$", "$Lumens.com-PDP-zoom$"),
-            url.replace("$Lumens.com-PDP-large$", "$Lumens.com-Product-Zoom$"),
-            url.replace("$Lumens.com-PDP-large$", "$Lumens.com-zoom$"),
-        ])
 
-    base_no_preset = url
-    try:
-        if "?" in url:
-            path, q = url.split("?", 1)
-            if q.startswith("$") and q.endswith("$"):
-                base_no_preset = path
-    except Exception:
-        pass
+    # If query is a pure preset, try common zoom presets
+    if "?" in url:
+        path, q = url.split("?", 1)
+        if q.startswith("$") and q.endswith("$"):
+            for preset in [
+                "$Lumens.com-PDP-zoom$",
+                "$Lumens.com-Product-Zoom$",
+                "$Lumens.com-zoom$",
+                "$zoom$",
+            ]:
+                candidates.append(f"{path}?{preset}")
 
-    for qs in [{"wid": 2400, "qlt": 90, "fmt": "jpg"},
-               {"wid": 2000, "qlt": 90, "fmt": "jpg"},
-               {"wid": 1600, "qlt": 90, "fmt": "jpg"}]:
-        candidates.append(_update_query(base_no_preset, qs))
-    candidates.append(_update_query(url, {"wid": 2000, "qlt": 90}))
+    # Strip preset entirely
+    no_preset = _strip_scene7_preset(url)
+    candidates.append(no_preset)
 
+    # High-quality width variants on no-preset base
+    for wid in (2400, 3000, 4000):
+        for extras in (
+            {"wid": wid, "qlt": 95, "fmt": "jpg"},
+            {"wid": wid, "qlt": 95, "fmt": "jpg", "scl": 1},
+            {"wid": wid, "qlt": 95, "fmt": "jpg", "scl": 1, "resMode": "sharp2", "op_usm": "1.0,1.0,6,0"},
+        ):
+            candidates.append(_update_query(no_preset, extras))
+
+    # Also try layering wid/qlt on original
+    candidates.append(_update_query(url, {"wid": 3000, "qlt": 95, "fmt": "jpg"}))
+
+    # De-dupe
     seen, uniq = set(), []
     for c in candidates:
         if c not in seen:
             seen.add(c)
             uniq.append(c)
 
-    best_len, best_url = -1, url
+    # Measure actual dimensions; keep the widest (then tallest)
+    best_url, best_w, best_h = url, -1, -1
     for cand in uniq:
-        clen, final = _head_size(cand)
-        if clen > best_len:
-            best_len, best_url = clen, final
+        w, h = _measure_image_dims(cand)
+        if w > best_w or (w == best_w and h > best_h):
+            best_url, best_w, best_h = cand, w, h
+
     return best_url
 
 # ===================== Firecrawl v2 (REST) helpers =====================
@@ -554,7 +597,7 @@ def enrich_lumens_v2(url: str, api_key: str) -> Tuple[str, str, str]:
             price = price or p2
             status = "firecrawl_v2_gentle"
 
-    # aggressive (evaluate)
+    # aggressive (evaluate + JS)
     if not img:
         sc3 = firecrawl_scrape_v2_aggressive(u, api_key)
         i3, p3 = parse_image_and_price_from_v2_aggressive(sc3)
@@ -729,7 +772,7 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str]) -> pd.Da
                 else:
                     st_code = (st_code + "+fetch_failed") if st_code else "fetch_failed"
 
-            # Upgrade Scene7 if applicable
+            # Upgrade Scene7 if applicable (final pass)
             if img and ("images.lumens.com/is/image" in img or "/is/image/" in img):
                 img = lumens_upgrade_scene7_url(img)
 
@@ -841,7 +884,7 @@ with tab3:
             else:
                 status = (status + "+fetch_failed") if status else "fetch_failed"
 
-        # Upgrade Scene7 if applicable
+        # Upgrade Scene7 if applicable (final pass)
         if img and ("images.lumens.com/is/image" in img or "/is/image/" in img):
             img = lumens_upgrade_scene7_url(img)
 
