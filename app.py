@@ -109,7 +109,7 @@ def extract_link_title_exact(page, rect, pad_px: float = 4.0, inflate_pct: float
     Collect ALL words that overlap the link rectangle by at least `overlap_min` (10% default).
     Inflate the rect a little to avoid edge truncation. Sort top→down, left→right.
     """
-    import math
+    import re, fitz
     if not rect:
         return ""
     r = fitz.Rect(rect).normalize()
@@ -134,8 +134,9 @@ def extract_link_title_exact(page, rect, pad_px: float = 4.0, inflate_pct: float
         inter = intersect_area(R, wb)
         if inter <= 0:
             continue
-        # require at least N% of the word box overlapped
-        if inter / max(wb.get_area(), 1.0) >= overlap_min:
+        # —— FIX: manual area calculation instead of wb.get_area() ——
+        word_area = max((wb.x1 - wb.x0) * (wb.y1 - wb.y0), 1.0)
+        if inter / word_area >= overlap_min:
             kept.append((y0, x0, wtext))
 
     if not kept:
@@ -143,8 +144,6 @@ def extract_link_title_exact(page, rect, pad_px: float = 4.0, inflate_pct: float
 
     kept.sort(key=lambda t: (round(t[0], 2), t[1]))
     txt = " ".join(t[2] for t in kept)
-
-    # Normalize separators: pipes & semicolons, collapse extra spaces
     txt = re.sub(r"\s*\|\s*", " | ", txt)
     txt = re.sub(r"\s*;\s*", "; ", txt)
     txt = re.sub(r"\s{2,}", " ", txt).strip()
@@ -500,3 +499,4 @@ with tab3:
         st.write("**Price:**", price or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
