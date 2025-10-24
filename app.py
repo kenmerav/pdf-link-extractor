@@ -1,5 +1,5 @@
 # app.py — Full app with:
-# 1) Canva PDF → Page→Tags + strict link title capture + Type/QTY/Finish/Size parsing
+# 1) Canva PDF → Page→Tags + strict link title capture + Position + Type/QTY/Finish/Size parsing
 # 2) Enrich CSV (Firecrawl v2 → bs4 fallback) to get image URL + price
 # 3) Test a single URL
 
@@ -12,6 +12,9 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urlunparse, urljoin
 
 # ========================= Shared helpers =========================
+st.set_page_config(page_title="Spec Link Toolkit", layout="wide")
+st.title("🧰 Spec Link Toolkit")
+
 PRICE_RE = re.compile(r"\$\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?")  # $1,234.56
 UA = {"User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
 
@@ -24,7 +27,7 @@ def norm_url(u: str) -> str:
         netloc = p.netloc.lower()
         if netloc.startswith("www."):
             netloc = netloc[4:]
-        return urlunparse((p.scheme, netloc, p.path, p.params, p.query, ""))  # keep query intact
+        return urlunparse((p.scheme, netloc, p.path, p.params, p.query, ""))  # keep query intact, drop fragment
     except Exception:
         return u.strip()
 
@@ -104,12 +107,48 @@ def parse_link_title_fields(link_text: str) -> dict:
 
     return fields
 
+# Numbered-bullet detection and cleaning (Position + single-item title)
+NUM_DOT = re.compile(r"\b(\d{1,3})\.\s")  # matches “1. ”, “12. ”, etc.
+
+def split_position_and_title(raw: str) -> tuple[str, str]:
+    """
+    From a raw link title that might include neighbors, return (position, clean_title).
+
+    - Finds the FIRST numbered-bullet like '12. '.
+    - Cuts the title OFF right BEFORE the NEXT numbered-bullet.
+    - Returns the number as Position and the cleaned title (without the '12. ' prefix).
+    """
+    s = (raw or "").strip()
+    if not s:
+        return "", ""
+
+    matches = list(NUM_DOT.finditer(s))
+    if not matches:
+        # No bullet number—return as-is
+        clean = re.sub(r"\s*\|\s*", " | ", s)
+        clean = re.sub(r"\s*;\s*", "; ", clean)
+        clean = re.sub(r"\s{2,}", " ", clean).strip()
+        return "", clean
+
+    first = matches[0]
+    pos_num = first.group(1)
+
+    end = len(s)
+    if len(matches) >= 2:
+        end = matches[1].start()
+
+    clean = s[first.end():end].strip()
+    clean = re.sub(r"\s*\|\s*", " | ", clean)
+    clean = re.sub(r"\s*;\s*", "; ", clean)
+    clean = re.sub(r"\s{2,}", " ", clean).strip()
+
+    return pos_num, clean
+
 def extract_link_title_exact(page, rect, pad_px: float = 4.0, inflate_pct: float = 0.02, overlap_min: float = 0.10) -> str:
     """
     Collect ALL words that overlap the link rectangle by at least `overlap_min` (10% default).
     Inflate the rect a little to avoid edge truncation. Sort top→down, left→right.
     """
-    import re, fitz
     if not rect:
         return ""
     r = fitz.Rect(rect).normalize()
@@ -134,7 +173,7 @@ def extract_link_title_exact(page, rect, pad_px: float = 4.0, inflate_pct: float
         inter = intersect_area(R, wb)
         if inter <= 0:
             continue
-        # —— FIX: manual area calculation instead of wb.get_area() ——
+        # manual area (older PyMuPDF doesn’t have wb.get_area())
         word_area = max((wb.x1 - wb.x0) * (wb.y1 - wb.y0), 1.0)
         if inter / word_area >= overlap_min:
             kept.append((y0, x0, wtext))
@@ -144,6 +183,8 @@ def extract_link_title_exact(page, rect, pad_px: float = 4.0, inflate_pct: float
 
     kept.sort(key=lambda t: (round(t[0], 2), t[1]))
     txt = " ".join(t[2] for t in kept)
+
+    # Normalize separators: pipes & semicolons, collapse extra spaces
     txt = re.sub(r"\s*\|\s*", " | ", txt)
     txt = re.sub(r"\s*;\s*", "; ", txt)
     txt = re.sub(r"\s{2,}", " ", txt).strip()
@@ -157,9 +198,9 @@ def extract_links_by_pages(
     """
     Collect *all* link annotations on selected pages (or all pages).
     - FULL link (including query) via norm_url()
-    - Title = exact text overlapping the link’s rectangle (no truncation)
-    - Parse Type/QTY/Finish/Size from that title
-    - Tags come from page→Tags mapping (you set these in the UI)
+    - Title = exact text overlapping the link’s rectangle
+    - Enforce per-item boundaries using leading number "N. "
+    - Output Position (the N) and parsed Type/QTY/Finish/Size
     """
     doc = fitz.open("pdf", pdf_bytes)
     rows = []
@@ -172,21 +213,26 @@ def extract_links_by_pages(
         tag_value = (page_to_tag or {}).get(pidx, "")
 
         for lnk in page.get_links():
-            uri = (lnk.get("uri") or "").strip()        # keep as-is (full URL)
+            uri = (lnk.get("uri") or "").strip()      # keep FULL URL
             rect = lnk.get("from")
-            title = extract_link_title_exact(page, rect, pad_px=4.0, inflate_pct=0.02, overlap_min=0.10)
+            raw_title = extract_link_title_exact(page, rect, pad_px=4.0, inflate_pct=0.02, overlap_min=0.10)
 
+            # Position + single-item title
+            position, title = split_position_and_title(raw_title)
+
+            # Parse fields from the cleaned title
             parsed = parse_link_title_fields(title)
 
             rows.append({
                 "page": pidx,
                 "Tags": tag_value,
+                "Position": position,               # new column
                 "Type": parsed.get("Type",""),
                 "QTY": parsed.get("QTY",""),
                 "Finish": parsed.get("Finish",""),
                 "Size": parsed.get("Size",""),
-                "link_url": norm_url(uri),
-                "link_text": title,
+                "link_url": norm_url(uri),          # FULL URL (keeps query)
+                "link_text": title,                 # cleaned, single-item title
             })
 
     return pd.DataFrame(rows)
@@ -370,23 +416,20 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str]) -> pd.Da
     return out
 
 # ========================= UI =========================
-st.set_page_config(page_title="Spec Link Toolkit", layout="wide")
-st.title("🧰 Spec Link Toolkit")
-
 with st.sidebar:
     st.subheader("Firecrawl (optional)")
     api_key_input = st.text_input("FIRECRAWL_API_KEY", value=os.getenv("FIRECRAWL_API_KEY",""), type="password")
     st.caption("Leave blank to use the built-in parser only (no credits used).")
 
 tab1, tab2, tab3 = st.tabs([
-    "1) Extract from PDF (pages + Tags + full titles)",
+    "1) Extract from PDF (pages + Tags + Position + full titles)",
     "2) Enrich CSV (Image URL + Price)",
     "3) Test single URL",
 ])
 
 # --- Tab 1 ---
 with tab1:
-    st.caption("Build a page→Tags table, then extract ALL links from those pages. Fields come from the FULL link title text.")
+    st.caption("Build a page→Tags table, then extract ALL links from those pages. Each row starts at its own numbered item, with Position captured.")
     pdf_file = st.file_uploader("Upload PDF", type="pdf", key="pdf_extractor")
     num_pages = None
     if pdf_file:
@@ -425,11 +468,11 @@ with tab1:
                 p_no = int(p_raw)
                 if p_no >= 1 and (num_pages is None or p_no <= num_pages):
                     page_to_tag[p_no] = t_raw
-            except: 
+            except:
                 continue
 
         pdf_bytes = pdf_file.read()
-        with st.spinner("Extracting links & titles…"):
+        with st.spinner("Extracting links, positions & titles…"):
             df = extract_links_by_pages(
                 pdf_bytes, page_to_tag, only_listed_pages=only_listed
             )
@@ -441,7 +484,7 @@ with tab1:
             st.download_button(
                 "Download CSV",
                 df.to_csv(index=False).encode("utf-8"),
-                file_name="canva_links_full_title.csv",
+                file_name="canva_links_with_position.csv",
                 mime="text/csv"
             )
 
@@ -499,4 +542,3 @@ with tab3:
         st.write("**Price:**", price or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
-
