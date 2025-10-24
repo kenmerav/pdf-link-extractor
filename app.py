@@ -49,33 +49,57 @@ FINISH_RE  = re.compile(r"^(?:Finish|FINISH)\s*:\s*(.+)$")
 SIZE_RE    = re.compile(r"^(?:Size|SIZE)\s*:\s*(.+)$")
 TYPE_RE    = re.compile(r"^(?:Type|TYPE)\s*:\s*(.+)$")
 
+QTY_RE     = re.compile(r"^(?:QTY|Qty|qty|Quantity)\s*:\s*(\d+)\s*$")
+FINISH_RE  = re.compile(r"^(?:Finish|FINISH)\s*:\s*(.+)$")
+SIZE_RE    = re.compile(r"^(?:Size|SIZE|Dimensions?)\s*:\s*(.+)$")
+TYPE_RE    = re.compile(r"^(?:Type|TYPE)\s*:\s*(.+)$")
+
 def parse_link_title_fields(link_text: str) -> dict:
+    """
+    Parse 'Type | QTY: 2 | Finish: Brass | Size: 20"' style strings.
+    Also handles ';' separators and infers Type from first unlabeled token.
+    """
     fields = {"Type": "", "QTY": "", "Finish": "", "Size": ""}
-    if not link_text:
+    if not (link_text or "").strip():
         return fields
+
     s = (link_text or "").replace("\n", " | ")
     parts = []
     for chunk in s.split("|"):
         sub = [x.strip() for x in chunk.split(";")]
         parts.extend([x for x in sub if x])
 
+    # explicit key:value
     for tok in parts:
         m = TYPE_RE.match(tok)
-        if m and not fields["Type"]: fields["Type"] = m.group(1).strip(); continue
+        if m and not fields["Type"]:
+            fields["Type"] = m.group(1).strip(); continue
         m = QTY_RE.match(tok)
-        if m and not fields["QTY"]: fields["QTY"] = m.group(1).strip(); continue
+        if m and not fields["QTY"]:
+            fields["QTY"] = m.group(1).strip(); continue
         m = FINISH_RE.match(tok)
-        if m and not fields["Finish"]: fields["Finish"] = m.group(1).strip(); continue
+        if m and not fields["Finish"]:
+            fields["Finish"] = m.group(1).strip(); continue
         m = SIZE_RE.match(tok)
-        if m and not fields["Size"]: fields["Size"] = m.group(1).strip(); continue
+        if m and not fields["Size"]:
+            fields["Size"] = m.group(1).strip(); continue
 
+    # infer Type if still empty: take first unlabeled token that isn't obviously a label/value
     if not fields["Type"]:
         for tok in parts:
-            if ":" not in tok and not QTY_RE.match(tok):
-                if tok.lower() not in ("finish", "size", "qty", "quantity"):
-                    fields["Type"] = tok.strip()
-                    break
+            if ":" in tok:  # labeled, already handled
+                continue
+            # skip pure quantity tokens like "2" or "Qty"
+            if tok.strip().isdigit():
+                continue
+            low = tok.lower()
+            if low in ("qty", "quantity", "finish", "size", "dimensions"):
+                continue
+            fields["Type"] = tok.strip()
+            break
+
     return fields
+
 
 def expand_rect(rect: fitz.Rect, page_w: float, page_h: float, pad_pct: float) -> fitz.Rect:
     dx = page_w * pad_pct
@@ -153,9 +177,11 @@ def link_text_from_words(page, rect: fitz.Rect, pad: float = 1.5) -> str:
 
     kept.sort(key=lambda t: (round(t[0], 1), t[1]))
     txt = " ".join(t[2] for t in kept)
-    txt = re.sub(r"\s*\|\s*", " | ", txt)
-    txt = re.sub(r"\s*;\s*", "; ", txt)
-    txt = re.sub(r"\s{2,}", " ", txt).strip()
+    # light normalization so separators look right
+    import re as _re
+    txt = _re.sub(r"\s*\|\s*", " | ", txt)
+    txt = _re.sub(r"\s*;\s*", "; ", txt)
+    txt = _re.sub(r"\s{2,}", " ", txt).strip()
     return txt
 
 
@@ -512,5 +538,6 @@ with tab3:
         st.write("**Price:**", price or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
 
 
