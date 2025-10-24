@@ -91,69 +91,101 @@ def parse_link_title_fields(link_text: str) -> dict:
     return fields
 
 # STRICT per-link text capture: only words whose CENTER lies inside link box
-def extract_link_title_strict(page, rect, pad_px: float = 2.0) -> str:
+def extract_link_title_strict(page, rect, pad_px: float = 2.0, band_px: float = 18.0) -> str:
     """
-    Return the text for *this link only*:
-      - Inflate the link rect by a small pixel pad
-      - Keep words whose *center* falls inside that rect
-      - Sort by (y, x) and join
+    Capture text for this link only.
+    - Primary: words whose center lies inside (rect ± pad_px)
+    - If empty: look in a thin horizontal band around the rect (for cases where
+      the link is only on an image or underline but the label sits just outside).
+    - Words are taken from raw block->line->span order for stable layout order.
     """
+    import fitz, re
+    def norm(s: str) -> str:
+        s = re.sub(r"\s*\|\s*", " | ", s)
+        s = re.sub(r"\s*;\s*", "; ", s)
+        s = re.sub(r"\s{2,}", " ", s)
+        return s.strip()
+
     if not rect:
         return ""
+
     r = fitz.Rect(rect).normalize()
     R = fitz.Rect(r.x0 - pad_px, r.y0 - pad_px, r.x1 + pad_px, r.y1 + pad_px)
 
-    words = page.get_text("words")  # [x0, y0, x1, y1, text, block, line, word]
-    kept = []
-    for x0, y0, x1, y1, wtext, *_ in words:
-        if not wtext:
+    raw = page.get_text("rawdict") or {}
+    words = []
+    # preserve reading order: block -> line -> span
+    for blk in raw.get("blocks", []):
+        if blk.get("type") != 0:
             continue
-        cx = (x0 + x1) / 2.0
-        cy = (y0 + y1) / 2.0
-        if R.contains(fitz.Point(cx, cy)):
-            kept.append((round(y0, 3), x0, wtext))
+        for line in blk.get("lines", []):
+            for span in line.get("spans", []):
+                tx = span.get("text", "")
+                bbox = span.get("bbox", None)
+                if not tx or not bbox:
+                    continue
+                x0, y0, x1, y1 = bbox
+                cx = (x0 + x1) / 2.0
+                cy = (y0 + y1) / 2.0
+                words.append((cx, cy, x0, y0, x1, y1, tx))
+
+    # keep those whose center is inside inflated rect
+    kept = [(y0, x0, tx) for cx, cy, x0, y0, x1, y1, tx in words
+            if R.contains(fitz.Point(cx, cy)) and tx]
+
+    if not kept:
+        # Nearby band fallback: same y range ± band_px, and overlapping x
+        band = fitz.Rect(r.x0, r.y0 - band_px, r.x1, r.y1 + band_px)
+        kept = []
+        for cx, cy, x0, y0, x1, y1, tx in words:
+            if not tx:
+                continue
+            cy_in = (band.y0 <= cy <= band.y1)
+            x_overlaps = not (x1 < r.x0 or x0 > r.x1)
+            if cy_in and x_overlaps:
+                kept.append((y0, x0, tx))
 
     if not kept:
         return ""
 
-    kept.sort(key=lambda t: (t[0], t[1]))
-    txt = " ".join(t[2] for t in kept)
-    txt = re.sub(r"\s*\|\s*", " | ", txt)
-    txt = re.sub(r"\s*;\s*", "; ", txt)
-    txt = re.sub(r"\s{2,}", " ", txt).strip()
-    return txt
+    kept.sort(key=lambda t: (round(t[0], 3), t[1]))
+    return norm(" ".join(t[2] for t in kept))
 
 # Position is only at the START of this link’s text (we do not read past the link)
-POS_AT_START = re.compile(r'^\s*(\d{1,3})[.\u2024\u00B7]?\s*')  # 1. or 1.
+# tolerate "1.PENDANTS" / "1. PENDANTS" / unicode dot
+POS_AT_START = re.compile(r'^\s*(\d{1,3})[.\u2024\u00B7]?\s*')
+# next bullet *inside* a captured string (to trim accidental merges)
+NEXT_BULLET = re.compile(r'\s(\d{1,3})[.\u2024\u00B7](?=\s|[A-Z])')
 
 def split_position_and_title_start(raw: str) -> tuple[str, str]:
     """
-    From this link’s own text, pull Position at the *start* and strip it off.
-    No attempt to look for the next number (we already restrict to this link’s box).
+    Pull Position at the start of this link's text; if another bullet appears
+    later in the same string, cut at that bullet to avoid merging.
     """
     s = (raw or "").strip()
     if not s:
         return "", ""
     m = POS_AT_START.match(s)
     if not m:
+        # no leading number—return as-is
         return "", s
     pos = m.group(1)
-    title = s[m.end():].strip()
-    return pos, title
+    rest = s[m.end():].strip()
+
+    # If we accidentally captured the next item too, trim at next bullet
+    m2 = NEXT_BULLET.search(rest)
+    if m2:
+        rest = rest[:m2.start()].strip()
+    return pos, rest
 
 def extract_links_by_pages(
     pdf_bytes: bytes,
     page_to_tag: dict[int, str] | None,
     only_listed_pages: bool = True,
     pad_px: float = 2.0,
+    band_px: float = 18.0,
+    require_leading_number: bool = False,  # set True if your doc always numbers items
 ) -> pd.DataFrame:
-    """
-    Collect *all* web link annotations on selected pages (or all pages).
-    - Keeps the FULL URL exactly as in the PDF (including query)
-    - Title = strict text inside link box (no bleed)
-    - Position parsed only from the start of that title
-    - Parses Type/QTY/Finish/Size from the cleaned title
-    """
     doc = fitz.open("pdf", pdf_bytes)
     rows = []
     listed = set(page_to_tag.keys()) if page_to_tag else set()
@@ -161,28 +193,33 @@ def extract_links_by_pages(
     for pidx, page in enumerate(doc, start=1):
         if only_listed_pages and page_to_tag and pidx not in listed:
             continue
-
         tag_value = (page_to_tag or {}).get(pidx, "")
 
         for lnk in page.get_links():
             uri = (lnk.get("uri") or "").strip()
             if not uri.lower().startswith(("http://", "https://")):
                 continue
+
             rect = lnk.get("from")
-            raw = extract_link_title_strict(page, rect, pad_px=pad_px)
+            raw = extract_link_title_strict(page, rect, pad_px=pad_px, band_px=band_px)
             position, title = split_position_and_title_start(raw)
-            parsed = parse_link_title_fields(title)
+
+            if require_leading_number and not position:
+                # skip labels that aren't list items if you toggle this on
+                continue
+
+            fields = parse_link_title_fields(title)
 
             rows.append({
                 "page": pidx,
                 "Tags": tag_value,
                 "Position": position,
-                "Type": parsed.get("Type", ""),
-                "QTY": parsed.get("QTY", ""),
-                "Finish": parsed.get("Finish", ""),
-                "Size": parsed.get("Size", ""),
-                "link_url": uri,       # EXACT link for this annotation
-                "link_text": title,    # clean title for this link only
+                "Type": fields.get("Type",""),
+                "QTY": fields.get("QTY",""),
+                "Finish": fields.get("Finish",""),
+                "Size": fields.get("Size",""),
+                "link_url": uri,     # full URL
+                "link_text": title,  # per-link, trimmed if a next bullet was detected
             })
 
     return pd.DataFrame(rows)
@@ -504,3 +541,4 @@ with tab3:
         st.write("**Price:**", price or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
