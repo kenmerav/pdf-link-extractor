@@ -1,5 +1,5 @@
-# app.py — Full app with 3 tabs:
-# 1) Canva PDF → page→Tags table + FULL link title parsing (Type/QTY/Finish/Size)
+# app.py — Full app with:
+# 1) Canva PDF → Page→Tags + strict link title capture + Type/QTY/Finish/Size parsing
 # 2) Enrich CSV (Firecrawl v2 → bs4 fallback) to get image URL + price
 # 3) Test a single URL
 
@@ -12,11 +12,8 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urlunparse, urljoin
 
 # ========================= Shared helpers =========================
-URL_RE = re.compile(r'https?://\S+', re.IGNORECASE)
 PRICE_RE = re.compile(r"\$\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?")  # $1,234.56
 UA = {"User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
-
-from urllib.parse import urlparse, urlunparse
 
 def norm_url(u: str) -> str:
     """Keep scheme/host/path/params/query exactly; only strip fragment. Lowercase host."""
@@ -31,7 +28,6 @@ def norm_url(u: str) -> str:
     except Exception:
         return u.strip()
 
-
 def requests_get(url: str, timeout: int = 20, retries: int = 2) -> Optional[requests.Response]:
     for _ in range(retries+1):
         try:
@@ -43,160 +39,128 @@ def requests_get(url: str, timeout: int = 20, retries: int = 2) -> Optional[requ
         time.sleep(0.25)
     return None
 
-# ========================= TAB 1: Canva PDF extractor =========================
-QTY_RE     = re.compile(r"^(?:QTY|Qty|qty)\s*:\s*(\d+)\s*$")
-FINISH_RE  = re.compile(r"^(?:Finish|FINISH)\s*:\s*(.+)$")
-SIZE_RE    = re.compile(r"^(?:Size|SIZE)\s*:\s*(.+)$")
-TYPE_RE    = re.compile(r"^(?:Type|TYPE)\s*:\s*(.+)$")
+class Timer:
+    def __enter__(self): self.t0 = time.perf_counter(); return self
+    def __exit__(self, *exc): self.dt = time.perf_counter() - self.t0
 
-QTY_RE     = re.compile(r"^(?:QTY|Qty|qty|Quantity)\s*:\s*(\d+)\s*$")
-FINISH_RE  = re.compile(r"^(?:Finish|FINISH)\s*:\s*(.+)$")
-SIZE_RE    = re.compile(r"^(?:Size|SIZE|Dimensions?)\s*:\s*(.+)$")
-TYPE_RE    = re.compile(r"^(?:Type|TYPE)\s*:\s*(.+)$")
+# ========================= TAB 1: Canva PDF extractor =========================
+# Robust regexes for parsing the link title into columns
+QTY_RE     = re.compile(r"^(?:QTY|Qty|qty|Quantity)\s*:\s*([0-9Xx]+)\s*$")
+FINISH_RE  = re.compile(r"^(?:FINISH|Finish)\s*:\s*(.+)$")
+SIZE_RE    = re.compile(r"^(?:SIZE|Size|Dimensions?)\s*:\s*(.+)$")
+TYPE_RE    = re.compile(r"^(?:TYPE|Type)\s*:\s*(.+)$")
 
 def parse_link_title_fields(link_text: str) -> dict:
     """
-    Parse 'Type | QTY: 2 | Finish: Brass | Size: 20"' style strings.
-    Also handles ';' separators and infers Type from first unlabeled token.
+    Parse 'PENDANT | QTY: 1 | FINISH: Brass, White | SIZE: 48"' style strings.
+    Accepts pipes or semicolons. Infers Type from first unlabeled token if needed.
     """
     fields = {"Type": "", "QTY": "", "Finish": "", "Size": ""}
-    if not (link_text or "").strip():
+
+    s = (link_text or "").replace("\n", " | ").strip()
+    if not s:
         return fields
 
-    s = (link_text or "").replace("\n", " | ")
+    # split on pipes first, then on semicolons
     parts = []
     for chunk in s.split("|"):
-        sub = [x.strip() for x in chunk.split(";")]
-        parts.extend([x for x in sub if x])
+        subs = [x.strip() for x in chunk.split(";")]
+        parts.extend([x for x in subs if x])
 
-    # explicit key:value
+    # explicit labeled tokens
     for tok in parts:
         m = TYPE_RE.match(tok)
         if m and not fields["Type"]:
             fields["Type"] = m.group(1).strip(); continue
+
         m = QTY_RE.match(tok)
         if m and not fields["QTY"]:
-            fields["QTY"] = m.group(1).strip(); continue
+            q = m.group(1).strip()
+            fields["QTY"] = "" if q.upper() == "XX" else q
+            continue
+
         m = FINISH_RE.match(tok)
         if m and not fields["Finish"]:
-            fields["Finish"] = m.group(1).strip(); continue
+            fields["Finish"] = m.group(1).strip()
+            continue
+
         m = SIZE_RE.match(tok)
         if m and not fields["Size"]:
-            fields["Size"] = m.group(1).strip(); continue
+            fields["Size"] = m.group(1).strip()
+            continue
 
-    # infer Type if still empty: take first unlabeled token that isn't obviously a label/value
+    # infer Type from first unlabeled token
     if not fields["Type"]:
         for tok in parts:
-            if ":" in tok:  # labeled, already handled
+            if ":" in tok:
                 continue
-            # skip pure quantity tokens like "2" or "Qty"
-            if tok.strip().isdigit():
-                continue
-            low = tok.lower()
-            if low in ("qty", "quantity", "finish", "size", "dimensions"):
-                continue
-            fields["Type"] = tok.strip()
-            break
+            if tok.strip():
+                fields["Type"] = tok.strip()
+                break
+
+    if fields["Size"]:
+        # normalize spacing around X
+        fields["Size"] = re.sub(r"\s*[xX]\s*", " x ", fields["Size"]).strip()
 
     return fields
 
-
-def expand_rect(rect: fitz.Rect, page_w: float, page_h: float, pad_pct: float) -> fitz.Rect:
-    dx = page_w * pad_pct
-    dy = page_h * pad_pct
-    return fitz.Rect(rect.x0 - dx, rect.y0 - dy, rect.x1 + dx, rect.y1 + dy)
-
-def nearest_text_to_rect(page, target_rect: fitz.Rect, max_dist: float):
-    tx = page.get_text("blocks")
-    if not tx: return ""
-    cx = (target_rect.x0 + target_rect.x1) / 2.0
-    cy = (target_rect.y0 + target_rect.y1) / 2.0
-    best = (None, 1e18)
-    for b in tx:
-        x0, y0, x1, y1, txt = b[:5]
-        if not txt: continue
-        bx = (x0 + x1)/2.0; by = (y0 + y1)/2.0
-        d = ((bx-cx)**2 + (by-cy)**2) ** 0.5
-        if d < best[1]: best = (str(txt).strip(), d)
-    return best[0] if best[0] and best[1] <= max_dist else ""
-
-def link_text_from_words(page, rect: fitz.Rect, pad: float = 1.5) -> str:
+def extract_link_title_exact(page, rect, pad_px: float = 4.0, inflate_pct: float = 0.02, overlap_min: float = 0.10) -> str:
     """
-    Return EXACT text inside a link rectangle:
-    - collect words whose center lies inside the (slightly) expanded rect
-    - sort top-to-bottom, left-to-right
-    - join into a single string
+    Collect ALL words that overlap the link rectangle by at least `overlap_min` (10% default).
+    Inflate the rect a little to avoid edge truncation. Sort top→down, left→right.
     """
-    if rect is None:
+    import math
+    if not rect:
         return ""
     r = fitz.Rect(rect).normalize()
-    # small pixel padding helps when the link box is a hair smaller than the text
-    R = fitz.Rect(r.x0 - pad, r.y0 - pad, r.x1 + pad, r.y1 + pad)
 
-    words = page.get_text("words")  # [x0, y0, x1, y1, text, block, line, word]
+    # Inflate by percent of page + a few pixels
+    W, H = page.rect.width, page.rect.height
+    dx = max(pad_px, W * inflate_pct)
+    dy = max(pad_px, H * inflate_pct)
+    R = fitz.Rect(r.x0 - dx, r.y0 - dy, r.x1 + dx, r.y1 + dy)
+
+    def intersect_area(a: fitz.Rect, b: fitz.Rect) -> float:
+        x0 = max(a.x0, b.x0); y0 = max(a.y0, b.y0)
+        x1 = min(a.x1, b.x1); y1 = min(a.y1, b.y1)
+        if x1 <= x0 or y1 <= y0:
+            return 0.0
+        return (x1 - x0) * (y1 - y0)
+
+    words = page.get_text("words")  # [x0,y0,x1,y1, text, block, line, word]
     kept = []
-    for x0, y0, x1, y1, wtext, block, line, wno in words:
-        cx = (x0 + x1) / 2.0
-        cy = (y0 + y1) / 2.0
-        if R.contains(fitz.Point(cx, cy)):
+    for x0, y0, x1, y1, wtext, *_ in words:
+        wb = fitz.Rect(x0, y0, x1, y1)
+        inter = intersect_area(R, wb)
+        if inter <= 0:
+            continue
+        # require at least N% of the word box overlapped
+        if inter / max(wb.get_area(), 1.0) >= overlap_min:
             kept.append((y0, x0, wtext))
 
     if not kept:
         return ""
 
-    kept.sort(key=lambda t: (round(t[0], 1), t[1]))  # group by y (line), then x
+    kept.sort(key=lambda t: (round(t[0], 2), t[1]))
     txt = " ".join(t[2] for t in kept)
 
-    # light normalization so separators look right
+    # Normalize separators: pipes & semicolons, collapse extra spaces
     txt = re.sub(r"\s*\|\s*", " | ", txt)
     txt = re.sub(r"\s*;\s*", "; ", txt)
     txt = re.sub(r"\s{2,}", " ", txt).strip()
     return txt
 
-
-def link_text_from_words(page, rect: fitz.Rect, pad: float = 1.5) -> str:
-    """
-    Exact text inside the link rectangle (slight padding).
-    Joins words top→down, left→right for stable titles.
-    """
-    if not rect:
-        return ""
-    r = fitz.Rect(rect).normalize()
-    R = fitz.Rect(r.x0 - pad, r.y0 - pad, r.x1 + pad, r.y1 + pad)
-
-    words = page.get_text("words")  # [x0, y0, x1, y1, text, block, line, word]
-    kept = []
-    for x0, y0, x1, y1, wtext, block, line, wno in words:
-        cx = (x0 + x1) / 2.0
-        cy = (y0 + y1) / 2.0
-        if R.contains(fitz.Point(cx, cy)):
-            kept.append((y0, x0, wtext))
-
-    if not kept:
-        return ""
-
-    kept.sort(key=lambda t: (round(t[0], 1), t[1]))
-    txt = " ".join(t[2] for t in kept)
-    # light normalization so separators look right
-    import re as _re
-    txt = _re.sub(r"\s*\|\s*", " | ", txt)
-    txt = _re.sub(r"\s*;\s*", "; ", txt)
-    txt = _re.sub(r"\s{2,}", " ", txt).strip()
-    return txt
-
-
 def extract_links_by_pages(
     pdf_bytes: bytes,
     page_to_tag: dict[int, str] | None,
-    only_listed_pages: bool = True,
-    pad_pct: float = 0.03,            # kept for UI but not used here
-    neighbor_dist_pct: float = 0.05   # kept for UI but not used here
+    only_listed_pages: bool = True
 ) -> pd.DataFrame:
     """
-    NEW: collect *all* link annotations on each page, no filtering.
-    - Keep FULL link (including query string) via norm_url()
-    - Title = exact text inside the link’s rectangle (no region constraints)
-    - Tags still come from the page→Tags mapping table
+    Collect *all* link annotations on selected pages (or all pages).
+    - FULL link (including query) via norm_url()
+    - Title = exact text overlapping the link’s rectangle (no truncation)
+    - Parse Type/QTY/Finish/Size from that title
+    - Tags come from page→Tags mapping (you set these in the UI)
     """
     doc = fitz.open("pdf", pdf_bytes)
     rows = []
@@ -209,24 +173,24 @@ def extract_links_by_pages(
         tag_value = (page_to_tag or {}).get(pidx, "")
 
         for lnk in page.get_links():
-            uri = lnk.get("uri") or ""               # do NOT filter; take everything
+            uri = (lnk.get("uri") or "").strip()        # keep as-is (full URL)
             rect = lnk.get("from")
-            title = link_text_from_words(page, rect, pad=1.5)
+            title = extract_link_title_exact(page, rect, pad_px=4.0, inflate_pct=0.02, overlap_min=0.10)
+
+            parsed = parse_link_title_fields(title)
 
             rows.append({
                 "page": pidx,
                 "Tags": tag_value,
-                # leave parsed fields empty unless you still want them
-                "Type": "",
-                "QTY": "",
-                "Finish": "",
-                "Size": "",
-                "link_url": norm_url(uri),           # full URL (keeps query)
-                "link_text": title,                  # exact text in the clickable box
+                "Type": parsed.get("Type",""),
+                "QTY": parsed.get("QTY",""),
+                "Finish": parsed.get("Finish",""),
+                "Size": parsed.get("Size",""),
+                "link_url": norm_url(uri),
+                "link_text": title,
             })
 
     return pd.DataFrame(rows)
-
 
 # ========================= TAB 2/3: Firecrawl + fallback =========================
 def firecrawl_scrape_v2(url: str, api_key: str, mode: str = "simple") -> dict:
@@ -406,10 +370,6 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str]) -> pd.Da
     out["scrape_status"] = status
     return out
 
-class Timer:
-    def __enter__(self): self.t0 = time.perf_counter(); return self
-    def __exit__(self, *exc): self.dt = time.perf_counter() - self.t0
-
 # ========================= UI =========================
 st.set_page_config(page_title="Spec Link Toolkit", layout="wide")
 st.title("🧰 Spec Link Toolkit")
@@ -420,14 +380,14 @@ with st.sidebar:
     st.caption("Leave blank to use the built-in parser only (no credits used).")
 
 tab1, tab2, tab3 = st.tabs([
-    "1) Extract from PDF (pages + Tags + titles)",
+    "1) Extract from PDF (pages + Tags + full titles)",
     "2) Enrich CSV (Image URL + Price)",
     "3) Test single URL",
 ])
 
 # --- Tab 1 ---
 with tab1:
-    st.caption("Build a page→Tags table, then extract all links from those pages. Fields come from the FULL link title text.")
+    st.caption("Build a page→Tags table, then extract ALL links from those pages. Fields come from the FULL link title text.")
     pdf_file = st.file_uploader("Upload PDF", type="pdf", key="pdf_extractor")
     num_pages = None
     if pdf_file:
@@ -447,15 +407,17 @@ with tab1:
             "Tags": st.column_config.TextColumn("Tags", help="Room name for that page"),
         }
     )
-    with st.expander("Advanced capture settings"):
-        pad_pct = st.slider("Expand link rectangle by (%) of page size", 0.0, 10.0, 3.0, 0.5)/100.0
-        neighbor_dist_pct = st.slider("Nearest text fallback radius (% of page diagonal)", 0.0, 20.0, 5.0, 0.5)/100.0
 
     only_listed = st.checkbox("Only extract pages listed above", value=True)
-    run1 = st.button("Extract", type="primary", disabled=(pdf_file is None), key="extract_btn_v2")
+    run1 = st.button("Extract", type="primary", disabled=(pdf_file is None), key="extract_btn_v3")
 
     if run1 and pdf_file:
         page_to_tag = {}
+        if num_pages is None:
+            try:
+                num_pages = len(fitz.open("pdf", pdf_file.getvalue()))
+            except:
+                num_pages = None
         for _, row in mapping_df.iterrows():
             p_raw = str(row.get("page","")).strip()
             t_raw = str(row.get("Tags","")).strip()
@@ -464,16 +426,16 @@ with tab1:
                 p_no = int(p_raw)
                 if p_no >= 1 and (num_pages is None or p_no <= num_pages):
                     page_to_tag[p_no] = t_raw
-            except: continue
+            except: 
+                continue
 
         pdf_bytes = pdf_file.read()
         with st.spinner("Extracting links & titles…"):
             df = extract_links_by_pages(
-                pdf_bytes, page_to_tag, only_listed_pages=only_listed,
-                pad_pct=pad_pct, neighbor_dist_pct=neighbor_dist_pct
+                pdf_bytes, page_to_tag, only_listed_pages=only_listed
             )
         if df.empty:
-            st.info("No links found. Try adjusting capture settings or verify the PDF has live links.")
+            st.info("No links found. Verify the PDF links are live (not just images).")
         else:
             st.success(f"Extracted {len(df)} row(s).")
             st.dataframe(df, use_container_width=True)
@@ -538,6 +500,3 @@ with tab3:
         st.write("**Price:**", price or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
-
-
-
