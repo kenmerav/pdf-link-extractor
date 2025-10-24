@@ -1,5 +1,5 @@
 # app.py — Full app with 3 tabs:
-# 1) Canva PDF → page→Tags table + FULL link title parsing (Type/QTY/Finish/Size) + Position (list number)
+# 1) Canva PDF → page→Tags table + FULL link title parsing (Type/QTY/Finish/Size)
 # 2) Enrich CSV (Firecrawl v2 → bs4 fallback) to get image URL + price
 # 3) Test a single URL
 
@@ -12,8 +12,8 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urlunparse, urljoin
 
 # ========================= Shared helpers =========================
-URL_RE   = re.compile(r'https?://\S+', re.IGNORECASE)
-PRICE_RE = re.compile(r"\$\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?")
+URL_RE = re.compile(r'https?://\S+', re.IGNORECASE)
+PRICE_RE = re.compile(r"\$\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?")  # $1,234.56
 UA = {"User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
 
 def norm_url(u: str) -> str:
@@ -39,44 +39,32 @@ def requests_get(url: str, timeout: int = 20, retries: int = 2) -> Optional[requ
         time.sleep(0.25)
     return None
 
-class Timer:
-    def __enter__(self): self.t0 = time.perf_counter(); return self
-    def __exit__(self, *exc): self.dt = time.perf_counter() - self.t0
-
 # ========================= TAB 1: Canva PDF extractor =========================
 QTY_RE     = re.compile(r"^(?:QTY|Qty|qty)\s*:\s*(\d+)\s*$")
 FINISH_RE  = re.compile(r"^(?:Finish|FINISH)\s*:\s*(.+)$")
 SIZE_RE    = re.compile(r"^(?:Size|SIZE)\s*:\s*(.+)$")
 TYPE_RE    = re.compile(r"^(?:Type|TYPE)\s*:\s*(.+)$")
-NUM_PREFIX = re.compile(r"^\s*(\d{1,3})\.\s*(.*)$")  # e.g., "12. Pendant | ..."
 
 def parse_link_title_fields(link_text: str) -> dict:
-    """
-    Parse a link title string (without leading 'N.' number) into fields.
-    """
     fields = {"Type": "", "QTY": "", "Finish": "", "Size": ""}
-
     if not link_text:
         return fields
-
     s = (link_text or "").replace("\n", " | ")
     parts = []
     for chunk in s.split("|"):
         sub = [x.strip() for x in chunk.split(";")]
         parts.extend([x for x in sub if x])
 
-    # explicit key:value
     for tok in parts:
         m = TYPE_RE.match(tok)
-        if m and not fields["Type"]:   fields["Type"]   = m.group(1).strip(); continue
+        if m and not fields["Type"]: fields["Type"] = m.group(1).strip(); continue
         m = QTY_RE.match(tok)
-        if m and not fields["QTY"]:    fields["QTY"]    = m.group(1).strip(); continue
+        if m and not fields["QTY"]: fields["QTY"] = m.group(1).strip(); continue
         m = FINISH_RE.match(tok)
         if m and not fields["Finish"]: fields["Finish"] = m.group(1).strip(); continue
         m = SIZE_RE.match(tok)
-        if m and not fields["Size"]:   fields["Size"]   = m.group(1).strip(); continue
+        if m and not fields["Size"]: fields["Size"] = m.group(1).strip(); continue
 
-    # infer Type if missing
     if not fields["Type"]:
         for tok in parts:
             if ":" not in tok and not QTY_RE.match(tok):
@@ -90,7 +78,7 @@ def expand_rect(rect: fitz.Rect, page_w: float, page_h: float, pad_pct: float) -
     dy = page_h * pad_pct
     return fitz.Rect(rect.x0 - dx, rect.y0 - dy, rect.x1 + dx, rect.y1 + dy)
 
-def nearest_text_to_rect(page, target_rect: fitz.Rect, max_dist: float) -> str:
+def nearest_text_to_rect(page, target_rect: fitz.Rect, max_dist: float):
     tx = page.get_text("blocks")
     if not tx: return ""
     cx = (target_rect.x0 + target_rect.x1) / 2.0
@@ -104,47 +92,10 @@ def nearest_text_to_rect(page, target_rect: fitz.Rect, max_dist: float) -> str:
         if d < best[1]: best = (str(txt).strip(), d)
     return best[0] if best[0] and best[1] <= max_dist else ""
 
-def nearest_left_number(page, link_rect: fitz.Rect, max_dist: float) -> str:
-    """
-    Try to find a standalone 'N.' number in a text block immediately to the LEFT of the link.
-    """
-    tx = page.get_text("blocks")
-    if not tx: return ""
-    cx = link_rect.x0  # focus on left side
-    cy = (link_rect.y0 + link_rect.y1) / 2.0
-    best = (None, 1e18)
-    for b in tx:
-        x0, y0, x1, y1, txt = b[:5]
-        if not txt: continue
-        s = str(txt).strip()
-        # strict: the whole block is just "12." or similar (or starts with that and little else)
-        m = re.match(r"^\s*(\d{1,3})\.\s*$", s)
-        if not m:
-            # also accept if the number prefix is first token
-            m2 = re.match(r"^\s*(\d{1,3})\.\s+\S+", s)
-            if not m2:
-                continue
-            m = m2
-        # block center
-        bx = (x0 + x1)/2.0; by = (y0 + y1)/2.0
-        # must be horizontally left of the link’s left edge (with some tolerance)
-        if bx > link_rect.x0 + (link_rect.width * 0.1):
-            continue
-        d = ((bx-cx)**2 + (by-cy)**2) ** 0.5
-        if d < best[1] and d <= max_dist:
-            best = (m.group(1), d)
-    return best[0] or ""
-
 def extract_links_by_pages(pdf_bytes: bytes, page_to_tag: dict[int, str] | None,
                            only_listed_pages: bool = True,
                            pad_pct: float = 0.03,
                            neighbor_dist_pct: float = 0.05) -> pd.DataFrame:
-    """
-    For each link:
-      - Capture FULL title (expanded rect + nearest-text fallback)
-      - Pull leading 'N.' into Position
-      - Parse fields from the cleaned title
-    """
     doc = fitz.open("pdf", pdf_bytes)
     rows = []
     listed_pages = set(page_to_tag.keys()) if page_to_tag else set()
@@ -157,60 +108,40 @@ def extract_links_by_pages(pdf_bytes: bytes, page_to_tag: dict[int, str] | None,
         page_diag = (w**2 + h**2) ** 0.5
         max_neighbor_dist = page_diag * neighbor_dist_pct
 
+        page_links = []
         for lnk in page.get_links():
             uri = lnk.get("uri") or ""
-            if not uri.lower().startswith(("http://","https://")):
-                continue
-
+            if not uri.lower().startswith(("http://","https://")): continue
             rect = lnk.get("from")
             link_title = ""
-            position = ""
-
             if rect:
                 r = fitz.Rect(rect)
-                # 1) Expanded rect
                 try:
                     r_big = expand_rect(r, w, h, pad_pct)
                     link_title = page.get_textbox(r_big).strip()
                 except: link_title = ""
-                # 2) Original rect
                 if not link_title:
                     try:
                         link_title = page.get_textbox(r).strip()
                     except: link_title = ""
-                # 3) Nearest text
                 if not link_title:
                     link_title = nearest_text_to_rect(page, r, max_neighbor_dist)
+            page_links.append((norm_url(uri), link_title))
 
-                # Extract leading number from the captured title (e.g., "5. Pendant …")
-                m = NUM_PREFIX.match(link_title or "")
-                if m:
-                    position = m.group(1).strip()
-                    link_title_clean = m.group(2).strip()
-                else:
-                    link_title_clean = (link_title or "").strip()
-                    # If no leading number, try to find a left-side standalone "N." block
-                    if not position:
-                        pos_guess = nearest_left_number(page, r, max_neighbor_dist)
-                        if pos_guess:
-                            position = pos_guess
-
-            tag_value = (page_to_tag or {}).get(pidx, "")
-
-            parsed = parse_link_title_fields(link_title_clean)
+        if not page_links: continue
+        tag_value = (page_to_tag or {}).get(pidx, "")
+        for url, link_title in page_links:
+            parsed = parse_link_title_fields(link_title)
             rows.append({
                 "page": pidx,
-                "Position": position,
                 "Tags": tag_value,
                 "Type": parsed.get("Type",""),
                 "QTY": parsed.get("QTY",""),
                 "Finish": parsed.get("Finish",""),
                 "Size": parsed.get("Size",""),
-                "link_url": norm_url(uri),
-                "link_text": link_title,            # original full title captured
-                "link_text_clean": link_title_clean # without the "N."
+                "link_url": url,
+                "link_text": link_title,
             })
-
     return pd.DataFrame(rows)
 
 # ========================= TAB 2/3: Firecrawl + fallback =========================
@@ -244,6 +175,7 @@ def firecrawl_scrape_v2(url: str, api_key: str, mode: str = "simple") -> dict:
         return {}
 
 def parse_image_and_price_from_v2(scrape: dict) -> Tuple[str,str,str]:
+    """Return (image_url, price, html) from Firecrawl response."""
     if not scrape: return "","", ""
     data = scrape.get("data") or {}
     meta = data.get("metadata") or {}
@@ -390,6 +322,10 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str]) -> pd.Da
     out["scrape_status"] = status
     return out
 
+class Timer:
+    def __enter__(self): self.t0 = time.perf_counter(); return self
+    def __exit__(self, *exc): self.dt = time.perf_counter() - self.t0
+
 # ========================= UI =========================
 st.set_page_config(page_title="Spec Link Toolkit", layout="wide")
 st.title("🧰 Spec Link Toolkit")
@@ -400,14 +336,14 @@ with st.sidebar:
     st.caption("Leave blank to use the built-in parser only (no credits used).")
 
 tab1, tab2, tab3 = st.tabs([
-    "1) Extract from PDF (pages + Tags + titles + Position)",
+    "1) Extract from PDF (pages + Tags + titles)",
     "2) Enrich CSV (Image URL + Price)",
     "3) Test single URL",
 ])
 
 # --- Tab 1 ---
 with tab1:
-    st.caption("Build a page→Tags table, then extract all links from those pages. Fields come from the FULL link title text. The leading 'N.' is saved to Position.")
+    st.caption("Build a page→Tags table, then extract all links from those pages. Fields come from the FULL link title text.")
     pdf_file = st.file_uploader("Upload PDF", type="pdf", key="pdf_extractor")
     num_pages = None
     if pdf_file:
@@ -460,7 +396,7 @@ with tab1:
             st.download_button(
                 "Download CSV",
                 df.to_csv(index=False).encode("utf-8"),
-                file_name="canva_links_full_title_with_position.csv",
+                file_name="canva_links_full_title.csv",
                 mime="text/csv"
             )
 
