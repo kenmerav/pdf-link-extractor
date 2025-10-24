@@ -90,102 +90,16 @@ def parse_link_title_fields(link_text: str) -> dict:
 
     return fields
 
-# STRICT per-link text capture: only words whose CENTER lies inside link box
-def extract_link_title_strict(page, rect, pad_px: float = 2.0, band_px: float = 18.0) -> str:
-    """
-    Capture text for this link only.
-    - Primary: words whose center lies inside (rect ± pad_px)
-    - If empty: look in a thin horizontal band around the rect (for cases where
-      the link is only on an image or underline but the label sits just outside).
-    - Words are taken from raw block->line->span order for stable layout order.
-    """
-    import fitz, re
-    def norm(s: str) -> str:
-        s = re.sub(r"\s*\|\s*", " | ", s)
-        s = re.sub(r"\s*;\s*", "; ", s)
-        s = re.sub(r"\s{2,}", " ", s)
-        return s.strip()
-
-    if not rect:
-        return ""
-
-    r = fitz.Rect(rect).normalize()
-    R = fitz.Rect(r.x0 - pad_px, r.y0 - pad_px, r.x1 + pad_px, r.y1 + pad_px)
-
-    raw = page.get_text("rawdict") or {}
-    words = []
-    # preserve reading order: block -> line -> span
-    for blk in raw.get("blocks", []):
-        if blk.get("type") != 0:
-            continue
-        for line in blk.get("lines", []):
-            for span in line.get("spans", []):
-                tx = span.get("text", "")
-                bbox = span.get("bbox", None)
-                if not tx or not bbox:
-                    continue
-                x0, y0, x1, y1 = bbox
-                cx = (x0 + x1) / 2.0
-                cy = (y0 + y1) / 2.0
-                words.append((cx, cy, x0, y0, x1, y1, tx))
-
-    # keep those whose center is inside inflated rect
-    kept = [(y0, x0, tx) for cx, cy, x0, y0, x1, y1, tx in words
-            if R.contains(fitz.Point(cx, cy)) and tx]
-
-    if not kept:
-        # Nearby band fallback: same y range ± band_px, and overlapping x
-        band = fitz.Rect(r.x0, r.y0 - band_px, r.x1, r.y1 + band_px)
-        kept = []
-        for cx, cy, x0, y0, x1, y1, tx in words:
-            if not tx:
-                continue
-            cy_in = (band.y0 <= cy <= band.y1)
-            x_overlaps = not (x1 < r.x0 or x0 > r.x1)
-            if cy_in and x_overlaps:
-                kept.append((y0, x0, tx))
-
-    if not kept:
-        return ""
-
-    kept.sort(key=lambda t: (round(t[0], 3), t[1]))
-    return norm(" ".join(t[2] for t in kept))
-
-# Position is only at the START of this link’s text (we do not read past the link)
-# tolerate "1.PENDANTS" / "1. PENDANTS" / unicode dot
-POS_AT_START = re.compile(r'^\s*(\d{1,3})[.\u2024\u00B7]?\s*')
-# next bullet *inside* a captured string (to trim accidental merges)
-NEXT_BULLET = re.compile(r'\s(\d{1,3})[.\u2024\u00B7](?=\s|[A-Z])')
-
-def split_position_and_title_start(raw: str) -> tuple[str, str]:
-    """
-    Pull Position at the start of this link's text; if another bullet appears
-    later in the same string, cut at that bullet to avoid merging.
-    """
-    s = (raw or "").strip()
-    if not s:
-        return "", ""
-    m = POS_AT_START.match(s)
-    if not m:
-        # no leading number—return as-is
-        return "", s
-    pos = m.group(1)
-    rest = s[m.end():].strip()
-
-    # If we accidentally captured the next item too, trim at next bullet
-    m2 = NEXT_BULLET.search(rest)
-    if m2:
-        rest = rest[:m2.start()].strip()
-    return pos, rest
-
 def extract_links_by_pages(
     pdf_bytes: bytes,
     page_to_tag: dict[int, str] | None,
     only_listed_pages: bool = True,
     pad_px: float = 2.0,
-    band_px: float = 18.0,
-    require_leading_number: bool = False,  # set True if your doc always numbers items
 ) -> pd.DataFrame:
+    """
+    Extract numbered items from materials lists, matching each to its hyperlink.
+    Handles cases where multiple items share the same link or have overlapping boxes.
+    """
     doc = fitz.open("pdf", pdf_bytes)
     rows = []
     listed = set(page_to_tag.keys()) if page_to_tag else set()
@@ -193,35 +107,130 @@ def extract_links_by_pages(
     for pidx, page in enumerate(doc, start=1):
         if only_listed_pages and page_to_tag and pidx not in listed:
             continue
-        tag_value = (page_to_tag or {}).get(pidx, "")
 
+        tag_value = (page_to_tag or {}).get(pidx, "")
+        
+        # Get all text blocks with positions
+        blocks = page.get_text("dict")["blocks"]
+        text_items = []
+        
+        for block in blocks:
+            if block.get("type") == 0:  # text block
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        text = span.get("text", "").strip()
+                        if text:
+                            bbox = span["bbox"]
+                            text_items.append({
+                                "text": text,
+                                "x": bbox[0],
+                                "y": bbox[1],
+                                "x1": bbox[2],
+                                "y1": bbox[3],
+                                "cx": (bbox[0] + bbox[2]) / 2,
+                                "cy": (bbox[1] + bbox[3]) / 2
+                            })
+        
+        # Get all hyperlinks
+        links = []
         for lnk in page.get_links():
             uri = (lnk.get("uri") or "").strip()
-            if not uri.lower().startswith(("http://", "https://")):
-                continue
-
-            rect = lnk.get("from")
-            raw = extract_link_title_strict(page, rect, pad_px=pad_px, band_px=band_px)
-            position, title = split_position_and_title_start(raw)
-
-            if require_leading_number and not position:
-                # skip labels that aren't list items if you toggle this on
-                continue
-
-            fields = parse_link_title_fields(title)
-
+            if uri.lower().startswith(("http://", "https://")):
+                rect = lnk.get("from")
+                if rect:
+                    r = fitz.Rect(rect).normalize()
+                    links.append({
+                        "url": uri,
+                        "x0": r.x0,
+                        "y0": r.y0,
+                        "x1": r.x1,
+                        "y1": r.y1,
+                        "cx": (r.x0 + r.x1) / 2,
+                        "cy": (r.y0 + r.y1) / 2
+                    })
+        
+        # Find numbered items (1. 2. 3. etc)
+        numbered_pattern = re.compile(r'^(\d{1,3})[.\u2024\u00B7]?\s*(.*)$')
+        
+        # Group text into lines
+        text_items.sort(key=lambda x: (round(x["y"], 1), x["x"]))
+        
+        current_item = None
+        items_list = []
+        
+        for item in text_items:
+            text = item["text"]
+            match = numbered_pattern.match(text)
+            
+            if match:
+                # Save previous item
+                if current_item:
+                    items_list.append(current_item)
+                
+                # Start new item
+                position = match.group(1)
+                rest = match.group(2).strip()
+                current_item = {
+                    "position": position,
+                    "text_parts": [rest] if rest else [],
+                    "y_start": item["y"],
+                    "y_end": item["y1"],
+                    "x_start": item["x"],
+                    "x_end": item["x1"],
+                    "cy": item["cy"],
+                    "cx": item["cx"]
+                }
+            elif current_item and abs(item["y"] - current_item["y_start"]) < 20:
+                # Continue same item (on same line or nearby)
+                current_item["text_parts"].append(text)
+                current_item["y_end"] = max(current_item["y_end"], item["y1"])
+                current_item["x_end"] = max(current_item["x_end"], item["x1"])
+        
+        # Don't forget the last item
+        if current_item:
+            items_list.append(current_item)
+        
+        # Match each numbered item to nearest link
+        for item in items_list:
+            full_text = " ".join(item["text_parts"])
+            
+            # Find closest link (by center distance)
+            best_link = None
+            best_dist = float('inf')
+            
+            for link in links:
+                # Calculate distance between item center and link center
+                dist = ((item["cx"] - link["cx"]) ** 2 + (item["cy"] - link["cy"]) ** 2) ** 0.5
+                
+                # Also check if item overlaps with link box
+                x_overlap = not (item["x_end"] < link["x0"] or item["x_start"] > link["x1"])
+                y_overlap = not (item["y_end"] < link["y0"] or item["y_start"] > link["y1"])
+                
+                if x_overlap and y_overlap:
+                    dist = 0  # Perfect match - overlaps
+                
+                if dist < best_dist:
+                    best_dist = dist
+                    best_link = link
+            
+            # Only accept link if reasonably close (within 100 pixels)
+            link_url = best_link["url"] if best_link and best_dist < 100 else ""
+            
+            # Parse the fields
+            parsed = parse_link_title_fields(full_text)
+            
             rows.append({
                 "page": pidx,
                 "Tags": tag_value,
-                "Position": position,
-                "Type": fields.get("Type",""),
-                "QTY": fields.get("QTY",""),
-                "Finish": fields.get("Finish",""),
-                "Size": fields.get("Size",""),
-                "link_url": uri,     # full URL
-                "link_text": title,  # per-link, trimmed if a next bullet was detected
+                "Position": item["position"],
+                "Type": parsed.get("Type", ""),
+                "QTY": parsed.get("QTY", ""),
+                "Finish": parsed.get("Finish", ""),
+                "Size": parsed.get("Size", ""),
+                "link_url": link_url,
+                "link_text": full_text,
             })
-
+    
     return pd.DataFrame(rows)
 
 # ========================= TAB 2/3: Enricher (Firecrawl v2 + bs4) =========================
@@ -541,4 +550,3 @@ with tab3:
         st.write("**Price:**", price or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
-
