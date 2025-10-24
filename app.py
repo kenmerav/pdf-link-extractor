@@ -16,17 +16,21 @@ URL_RE = re.compile(r'https?://\S+', re.IGNORECASE)
 PRICE_RE = re.compile(r"\$\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?")  # $1,234.56
 UA = {"User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
 
+from urllib.parse import urlparse, urlunparse
+
 def norm_url(u: str) -> str:
+    """Keep scheme/host/path/params/query exactly; only strip fragment. Lowercase host."""
     if not isinstance(u, str) or not u.strip():
         return ""
     try:
         p = urlparse(u.strip())
         netloc = p.netloc.lower()
-        if netloc.startswith("www."): netloc = netloc[4:]
-        path = p.path.rstrip("/")
-        return urlunparse((p.scheme.lower(), netloc, path, "", "", ""))
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return urlunparse((p.scheme, netloc, p.path, p.params, p.query, ""))  # keep query intact
     except Exception:
         return u.strip()
+
 
 def requests_get(url: str, timeout: int = 20, retries: int = 2) -> Optional[requests.Response]:
     for _ in range(retries+1):
@@ -126,46 +130,73 @@ def link_text_from_words(page, rect: fitz.Rect, pad: float = 1.5) -> str:
     return txt
 
 
-def extract_links_by_pages(pdf_bytes: bytes,
-                           page_to_tag: dict[int, str] | None,
-                           only_listed_pages: bool = True,
-                           pad_pct: float = 0.03,              # kept for UI, but we won’t use it here
-                           neighbor_dist_pct: float = 0.05) -> pd.DataFrame:  # kept for UI
+def link_text_from_words(page, rect: fitz.Rect, pad: float = 1.5) -> str:
     """
-    STRICT mode: for each link annotation, grab ONLY the text inside that link box.
-    No nearest-text guessing. Then parse fields out of that exact title.
+    Exact text inside the link rectangle (slight padding).
+    Joins words top→down, left→right for stable titles.
+    """
+    if not rect:
+        return ""
+    r = fitz.Rect(rect).normalize()
+    R = fitz.Rect(r.x0 - pad, r.y0 - pad, r.x1 + pad, r.y1 + pad)
+
+    words = page.get_text("words")  # [x0, y0, x1, y1, text, block, line, word]
+    kept = []
+    for x0, y0, x1, y1, wtext, block, line, wno in words:
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        if R.contains(fitz.Point(cx, cy)):
+            kept.append((y0, x0, wtext))
+
+    if not kept:
+        return ""
+
+    kept.sort(key=lambda t: (round(t[0], 1), t[1]))
+    txt = " ".join(t[2] for t in kept)
+    txt = re.sub(r"\s*\|\s*", " | ", txt)
+    txt = re.sub(r"\s*;\s*", "; ", txt)
+    txt = re.sub(r"\s{2,}", " ", txt).strip()
+    return txt
+
+
+def extract_links_by_pages(
+    pdf_bytes: bytes,
+    page_to_tag: dict[int, str] | None,
+    only_listed_pages: bool = True,
+    pad_pct: float = 0.03,            # kept for UI but not used here
+    neighbor_dist_pct: float = 0.05   # kept for UI but not used here
+) -> pd.DataFrame:
+    """
+    NEW: collect *all* link annotations on each page, no filtering.
+    - Keep FULL link (including query string) via norm_url()
+    - Title = exact text inside the link’s rectangle (no region constraints)
+    - Tags still come from the page→Tags mapping table
     """
     doc = fitz.open("pdf", pdf_bytes)
     rows = []
-    listed_pages = set(page_to_tag.keys()) if page_to_tag else set()
+    listed = set(page_to_tag.keys()) if page_to_tag else set()
 
     for pidx, page in enumerate(doc, start=1):
-        if only_listed_pages and page_to_tag and pidx not in listed_pages:
+        if only_listed_pages and page_to_tag and pidx not in listed:
             continue
 
         tag_value = (page_to_tag or {}).get(pidx, "")
 
         for lnk in page.get_links():
-            uri = lnk.get("uri") or ""
-            if not uri.lower().startswith(("http://", "https://")):
-                continue
-
+            uri = lnk.get("uri") or ""               # do NOT filter; take everything
             rect = lnk.get("from")
-            # pull the EXACT title in the clickable box
-            link_title = link_text_from_words(page, rect, pad=1.5)
-
-            # If there is truly no text inside (e.g., image-only link), leave it blank.
-            parsed = parse_link_title_fields(link_title)
+            title = link_text_from_words(page, rect, pad=1.5)
 
             rows.append({
                 "page": pidx,
                 "Tags": tag_value,
-                "Type": parsed.get("Type",""),
-                "QTY": parsed.get("QTY",""),
-                "Finish": parsed.get("Finish",""),
-                "Size": parsed.get("Size",""),
-                "link_url": norm_url(uri),
-                "link_text": link_title,  # EXACT title inside the link box
+                # leave parsed fields empty unless you still want them
+                "Type": "",
+                "QTY": "",
+                "Finish": "",
+                "Size": "",
+                "link_url": norm_url(uri),           # full URL (keeps query)
+                "link_text": title,                  # exact text in the clickable box
             })
 
     return pd.DataFrame(rows)
@@ -481,4 +512,5 @@ with tab3:
         st.write("**Price:**", price or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
 
