@@ -1,6 +1,5 @@
-# app.py — Canva PDF selective extractor (pages + page→tag mapping)
+# app.py — Canva PDF selective extractor with Tags + parsed bottom-left fields
 import re
-import io
 import fitz  # PyMuPDF
 import pandas as pd
 import streamlit as st
@@ -74,6 +73,64 @@ def parse_page_tags_map(mapping_str: str) -> dict[int, str]:
             continue
     return out
 
+# -------- bottom-left parser: Type / QTY / Finish / Size ----------
+QTY_RE     = re.compile(r"^(?:QTY|Qty|qty)\s*:\s*(\d+)\s*$")
+FINISH_RE  = re.compile(r"^(?:Finish|FINISH)\s*:\s*(.+)$")
+SIZE_RE    = re.compile(r"^(?:Size|SIZE)\s*:\s*(.+)$")
+TYPE_RE    = re.compile(r"^(?:Type|TYPE)\s*:\s*(.+)$")
+
+def parse_bottom_left_fields(raw_text: str) -> dict:
+    """
+    Parse a bottom-left block into {Type, QTY, Finish, Size}.
+    Splits on '|' first, then on ';'. Accepts tokens like:
+      - "Pendant"  (becomes Type if no explicit Type:)
+      - "QTY: 2"
+      - "Finish: Black"
+      - "Size: 12\" x 8\""
+    Returns empty strings if not found.
+    """
+    fields = {"Type": "", "QTY": "", "Finish": "", "Size": ""}
+
+    if not raw_text.strip():
+        return fields
+
+    # Normalize separators: treat newlines as '|'
+    s = raw_text.replace("\n", " | ")
+    parts = []
+    for chunk in s.split("|"):
+        sub = [x.strip() for x in chunk.split(";")]
+        parts.extend([x for x in sub if x])
+
+    # Pass 1: explicit key:value tokens
+    for tok in parts:
+        m = TYPE_RE.match(tok)
+        if m and not fields["Type"]:
+            fields["Type"] = m.group(1).strip()
+            continue
+        m = QTY_RE.match(tok)
+        if m and not fields["QTY"]:
+            fields["QTY"] = m.group(1).strip()
+            continue
+        m = FINISH_RE.match(tok)
+        if m and not fields["Finish"]:
+            fields["Finish"] = m.group(1).strip()
+            continue
+        m = SIZE_RE.match(tok)
+        if m and not fields["Size"]:
+            fields["Size"] = m.group(1).strip()
+            continue
+
+    # Pass 2: infer Type from first standalone token (no colon) if still empty
+    if not fields["Type"]:
+        for tok in parts:
+            if ":" not in tok and not QTY_RE.match(tok):
+                # Avoid tokens that are just labels like "Finish" or "Size"
+                if tok.lower() not in ("finish", "size", "qty", "quantity"):
+                    fields["Type"] = tok.strip()
+                    break
+
+    return fields
+
 def extract_selected_pages(
     pdf_bytes: bytes,
     selected_pages: set[int],
@@ -83,12 +140,9 @@ def extract_selected_pages(
 ) -> pd.DataFrame:
     """
     For each selected page:
-      - bottom-left: capture the full “materials list” block as one string
+      - bottom-left: parse into Type/QTY/Finish/Size
       - links: every http(s) link on the page → each link = one row
       - Tags: from page_tags mapping (or blank if not provided)
-
-    Region heuristics (tuned for Canva spec pages):
-      - Bottom-left rectangle = x:[0 .. w*0.65], y:[h*0.55 .. h]
     """
     doc = fitz.open("pdf", pdf_bytes)
     rows = []
@@ -109,6 +163,7 @@ def extract_selected_pages(
                 if t:
                     bl_chunks.append(t)
         bottom_left_text = "\n".join(bl_chunks).strip()
+        parsed = parse_bottom_left_fields(bottom_left_text)
 
         # --- Collect links anywhere on the page ---
         page_links = []
@@ -126,22 +181,28 @@ def extract_selected_pages(
 
         tag_value = page_tags.get(pidx, "")
 
-        # One row per link (with the same bottom-left + tag for that page)
+        # One row per link (with the same parsed fields + tag for that page)
         if page_links:
             for url, ltxt in page_links:
                 rows.append({
                     "page": pidx,
                     "Tags": tag_value,
-                    "bottom_left_text": bottom_left_text,
+                    "Type": parsed.get("Type", ""),
+                    "QTY": parsed.get("QTY", ""),
+                    "Finish": parsed.get("Finish", ""),
+                    "Size": parsed.get("Size", ""),
                     "link_url": url,
                     "link_text": ltxt,
                 })
         else:
-            # If you also want to include pages that had no links, uncomment below:
+            # If you want to include pages that had no links, uncomment:
             # rows.append({
             #     "page": pidx,
             #     "Tags": tag_value,
-            #     "bottom_left_text": bottom_left_text,
+            #     "Type": parsed.get("Type",""),
+            #     "QTY": parsed.get("QTY",""),
+            #     "Finish": parsed.get("Finish",""),
+            #     "Size": parsed.get("Size",""),
             #     "link_url": "",
             #     "link_text": "",
             # })
@@ -150,24 +211,22 @@ def extract_selected_pages(
     return pd.DataFrame(rows)
 
 # ========================= Streamlit UI =========================
-st.set_page_config(page_title="Canva PDF → Links (selected pages + tags)", layout="wide")
-st.title("📄 Canva PDF Extractor — Selected Pages + Tags")
+st.set_page_config(page_title="Canva PDF → Links with Tags & Parsed Fields", layout="wide")
+st.title("📄 Canva PDF Extractor — Selected Pages + Tags + Parsed Bottom-left (Type/QTY/Finish/Size)")
 
 st.caption(
-    "Upload a Canva-exported PDF, choose which pages to process, and map pages to room tags. "
-    "Output: one row per link with the page’s full bottom-left text."
+    "Upload a Canva-exported PDF, choose pages, and map pages to room tags. "
+    "Output: one row per link with parsed bottom-left fields."
 )
 
 pdf_file = st.file_uploader("Upload PDF", type="pdf")
 
 # Peek page count for friendlier prompts
 num_pages_display = ""
-num_pages_val = None
 if pdf_file:
     try:
         tmp_doc = fitz.open("pdf", pdf_file.getvalue())
-        num_pages_val = len(tmp_doc)
-        num_pages_display = f"(PDF has {num_pages_val} pages)"
+        num_pages_display = f"(PDF has {len(tmp_doc)} pages)"
     except Exception:
         num_pages_display = ""
 
@@ -179,7 +238,7 @@ with col1:
     )
 with col2:
     tags_input = st.text_input(
-        "Page→Tag map (e.g. 3:Kitchen, 5:Bar, 8:Powder). Leave blank if you don't want tags.",
+        "Page→Tag map (e.g. 3:Kitchen, 5:Bar, 8:Powder).",
         value=""
     )
 
