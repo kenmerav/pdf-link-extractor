@@ -109,44 +109,46 @@ def parse_link_title_fields(link_text: str) -> dict:
 
 # Numbered-bullet detection and cleaning (Position + single-item title)
 # was: NUM_DOT = re.compile(r"\b(\d{1,3})\.\s")
-NUM_DOT = re.compile(r"\b(\d{1,3})\.(?:\s|$)")
+# Replace previous NUM_DOT with this more tolerant version
+# Matches: 1. PENDANTS  |  1.PENDANTS  |  1․PENDANTS (Unicode dot)
+NUM_BULLET = re.compile(r'(?<!\d)(\d{1,3})[.\u2024\u00B7](?:\s|$)')
 
 def split_position_and_title(raw: str) -> tuple[str, str]:
     """
-    Return (position, clean_title) for one numbered item:
-      - Start at the first 'N.' (space optional)
-      - Stop right before the next 'M.' (space optional)
-      - Strip the leading 'N.' from the returned title
+    Return (position, clean_title) for ONE numbered item:
+      - Start at the first bullet "N." (space optional; Unicode dot allowed)
+      - Stop just BEFORE the next bullet
+      - Strip the leading "N." itself from the returned title
     """
     s = (raw or "").strip()
     if not s:
         return "", ""
 
-    matches = list(NUM_DOT.finditer(s))
-    if not matches:
-        # No bullet; normalize and return as-is
+    m1 = NUM_BULLET.search(s)
+    if not m1:
+        # No bullet found; normalize separators and return as-is
         clean = re.sub(r"\s*\|\s*", " | ", s)
         clean = re.sub(r"\s*;\s*", "; ", clean)
         clean = re.sub(r"\s{2,}", " ", clean).strip()
         return "", clean
 
-    first = matches[0]
-    pos_num = first.group(1)
+    pos_num = m1.group(1)
+    start = m1.end()
 
-    # End right before the next bullet (if present)
-    end = len(s)
-    if len(matches) >= 2:
-        end = matches[1].start()
+    # Find the next bullet AFTER the first one
+    m2 = NUM_BULLET.search(s, pos=start)
+    end = m2.start() if m2 else len(s)
 
-    # Slice off the leading 'N.' (with or without a following space)
-    clean = s[first.end():end].strip()
+    # Slice current item only
+    clean = s[start:end].strip()
 
-    # Normalize separators / spaces
+    # Normalize separators/spaces (keeps `32"` intact)
     clean = re.sub(r"\s*\|\s*", " | ", clean)
     clean = re.sub(r"\s*;\s*", "; ", clean)
     clean = re.sub(r"\s{2,}", " ", clean).strip()
 
     return pos_num, clean
+
 
 def extract_link_title_exact(page, rect, pad_px: float = 4.0, inflate_pct: float = 0.02, overlap_min: float = 0.10) -> str:
     """
@@ -546,4 +548,5 @@ with tab3:
         st.write("**Price:**", price or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
 
