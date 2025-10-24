@@ -108,15 +108,15 @@ def parse_link_title_fields(link_text: str) -> dict:
     return fields
 
 # Numbered-bullet detection and cleaning (Position + single-item title)
-NUM_DOT = re.compile(r"\b(\d{1,3})\.\s")  # matches “1. ”, “12. ”, etc.
+# was: NUM_DOT = re.compile(r"\b(\d{1,3})\.\s")
+NUM_DOT = re.compile(r"\b(\d{1,3})\.(?:\s|$)")
 
 def split_position_and_title(raw: str) -> tuple[str, str]:
     """
-    From a raw link title that might include neighbors, return (position, clean_title).
-
-    - Finds the FIRST numbered-bullet like '12. '.
-    - Cuts the title OFF right BEFORE the NEXT numbered-bullet.
-    - Returns the number as Position and the cleaned title (without the '12. ' prefix).
+    Return (position, clean_title) for one numbered item:
+      - Start at the first 'N.' (space optional)
+      - Stop right before the next 'M.' (space optional)
+      - Strip the leading 'N.' from the returned title
     """
     s = (raw or "").strip()
     if not s:
@@ -124,7 +124,7 @@ def split_position_and_title(raw: str) -> tuple[str, str]:
 
     matches = list(NUM_DOT.finditer(s))
     if not matches:
-        # No bullet number—return as-is
+        # No bullet; normalize and return as-is
         clean = re.sub(r"\s*\|\s*", " | ", s)
         clean = re.sub(r"\s*;\s*", "; ", clean)
         clean = re.sub(r"\s{2,}", " ", clean).strip()
@@ -133,11 +133,15 @@ def split_position_and_title(raw: str) -> tuple[str, str]:
     first = matches[0]
     pos_num = first.group(1)
 
+    # End right before the next bullet (if present)
     end = len(s)
     if len(matches) >= 2:
         end = matches[1].start()
 
+    # Slice off the leading 'N.' (with or without a following space)
     clean = s[first.end():end].strip()
+
+    # Normalize separators / spaces
     clean = re.sub(r"\s*\|\s*", " | ", clean)
     clean = re.sub(r"\s*;\s*", "; ", clean)
     clean = re.sub(r"\s{2,}", " ", clean).strip()
@@ -542,3 +546,4 @@ with tab3:
         st.write("**Price:**", price or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
