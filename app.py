@@ -92,10 +92,49 @@ def nearest_text_to_rect(page, target_rect: fitz.Rect, max_dist: float):
         if d < best[1]: best = (str(txt).strip(), d)
     return best[0] if best[0] and best[1] <= max_dist else ""
 
-def extract_links_by_pages(pdf_bytes: bytes, page_to_tag: dict[int, str] | None,
+def link_text_from_words(page, rect: fitz.Rect, pad: float = 1.5) -> str:
+    """
+    Return EXACT text inside a link rectangle:
+    - collect words whose center lies inside the (slightly) expanded rect
+    - sort top-to-bottom, left-to-right
+    - join into a single string
+    """
+    if rect is None:
+        return ""
+    r = fitz.Rect(rect).normalize()
+    # small pixel padding helps when the link box is a hair smaller than the text
+    R = fitz.Rect(r.x0 - pad, r.y0 - pad, r.x1 + pad, r.y1 + pad)
+
+    words = page.get_text("words")  # [x0, y0, x1, y1, text, block, line, word]
+    kept = []
+    for x0, y0, x1, y1, wtext, block, line, wno in words:
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        if R.contains(fitz.Point(cx, cy)):
+            kept.append((y0, x0, wtext))
+
+    if not kept:
+        return ""
+
+    kept.sort(key=lambda t: (round(t[0], 1), t[1]))  # group by y (line), then x
+    txt = " ".join(t[2] for t in kept)
+
+    # light normalization so separators look right
+    txt = re.sub(r"\s*\|\s*", " | ", txt)
+    txt = re.sub(r"\s*;\s*", "; ", txt)
+    txt = re.sub(r"\s{2,}", " ", txt).strip()
+    return txt
+
+
+def extract_links_by_pages(pdf_bytes: bytes,
+                           page_to_tag: dict[int, str] | None,
                            only_listed_pages: bool = True,
-                           pad_pct: float = 0.03,
-                           neighbor_dist_pct: float = 0.05) -> pd.DataFrame:
+                           pad_pct: float = 0.03,              # kept for UI, but we won’t use it here
+                           neighbor_dist_pct: float = 0.05) -> pd.DataFrame:  # kept for UI
+    """
+    STRICT mode: for each link annotation, grab ONLY the text inside that link box.
+    No nearest-text guessing. Then parse fields out of that exact title.
+    """
     doc = fitz.open("pdf", pdf_bytes)
     rows = []
     listed_pages = set(page_to_tag.keys()) if page_to_tag else set()
@@ -104,34 +143,20 @@ def extract_links_by_pages(pdf_bytes: bytes, page_to_tag: dict[int, str] | None,
         if only_listed_pages and page_to_tag and pidx not in listed_pages:
             continue
 
-        w, h = page.rect.width, page.rect.height
-        page_diag = (w**2 + h**2) ** 0.5
-        max_neighbor_dist = page_diag * neighbor_dist_pct
+        tag_value = (page_to_tag or {}).get(pidx, "")
 
-        page_links = []
         for lnk in page.get_links():
             uri = lnk.get("uri") or ""
-            if not uri.lower().startswith(("http://","https://")): continue
-            rect = lnk.get("from")
-            link_title = ""
-            if rect:
-                r = fitz.Rect(rect)
-                try:
-                    r_big = expand_rect(r, w, h, pad_pct)
-                    link_title = page.get_textbox(r_big).strip()
-                except: link_title = ""
-                if not link_title:
-                    try:
-                        link_title = page.get_textbox(r).strip()
-                    except: link_title = ""
-                if not link_title:
-                    link_title = nearest_text_to_rect(page, r, max_neighbor_dist)
-            page_links.append((norm_url(uri), link_title))
+            if not uri.lower().startswith(("http://", "https://")):
+                continue
 
-        if not page_links: continue
-        tag_value = (page_to_tag or {}).get(pidx, "")
-        for url, link_title in page_links:
+            rect = lnk.get("from")
+            # pull the EXACT title in the clickable box
+            link_title = link_text_from_words(page, rect, pad=1.5)
+
+            # If there is truly no text inside (e.g., image-only link), leave it blank.
             parsed = parse_link_title_fields(link_title)
+
             rows.append({
                 "page": pidx,
                 "Tags": tag_value,
@@ -139,10 +164,12 @@ def extract_links_by_pages(pdf_bytes: bytes, page_to_tag: dict[int, str] | None,
                 "QTY": parsed.get("QTY",""),
                 "Finish": parsed.get("Finish",""),
                 "Size": parsed.get("Size",""),
-                "link_url": url,
-                "link_text": link_title,
+                "link_url": norm_url(uri),
+                "link_text": link_title,  # EXACT title inside the link box
             })
+
     return pd.DataFrame(rows)
+
 
 # ========================= TAB 2/3: Firecrawl + fallback =========================
 def firecrawl_scrape_v2(url: str, api_key: str, mode: str = "simple") -> dict:
@@ -454,3 +481,4 @@ with tab3:
         st.write("**Price:**", price or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
