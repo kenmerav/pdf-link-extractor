@@ -1,4 +1,8 @@
-# app.py — Canva PDF selective extractor with Tags + parsed bottom-left fields
+# app.py — Canva PDF extractor:
+# - Choose pages via an editable table: page | Tags (room name)
+# - One row per link on those pages
+# - Parse Type/QTY/Finish/Size FROM THE LINK TITLE TEXT
+
 import re
 import fitz  # PyMuPDF
 import pandas as pd
@@ -7,6 +11,10 @@ from urllib.parse import urlparse, urlunparse
 
 # ========================= Helpers =========================
 URL_RE = re.compile(r'https?://\S+', re.IGNORECASE)
+QTY_RE     = re.compile(r"^(?:QTY|Qty|qty)\s*:\s*(\d+)\s*$")
+FINISH_RE  = re.compile(r"^(?:Finish|FINISH)\s*:\s*(.+)$")
+SIZE_RE    = re.compile(r"^(?:Size|SIZE)\s*:\s*(.+)$")
+TYPE_RE    = re.compile(r"^(?:Type|TYPE)\s*:\s*(.+)$")
 
 def norm_url(u: str) -> str:
     """Normalize a URL: strip spaces, lowercase host, drop trailing slash in path."""
@@ -22,80 +30,19 @@ def norm_url(u: str) -> str:
     except Exception:
         return u.strip()
 
-def parse_page_selection(pages_str: str, num_pages: int) -> set[int]:
+def parse_link_title_fields(link_text: str) -> dict:
     """
-    Convert "1,3-5,8" into {1,3,4,5,8}. Pages are 1-based.
-    Clamp to [1, num_pages]. Blank = all pages.
-    """
-    if not pages_str:
-        return set(range(1, num_pages + 1))
-    out = set()
-    for chunk in pages_str.split(","):
-        c = chunk.strip()
-        if not c:
-            continue
-        if "-" in c:
-            a, b = c.split("-", 1)
-            try:
-                start = max(1, min(num_pages, int(a)))
-                end   = max(1, min(num_pages, int(b)))
-                lo, hi = (start, end) if start <= end else (end, start)
-                out.update(range(lo, hi + 1))
-            except:
-                pass
-        else:
-            try:
-                v = max(1, min(num_pages, int(c)))
-                out.add(v)
-            except:
-                pass
-    return out or set(range(1, num_pages + 1))
-
-def parse_page_tags_map(mapping_str: str) -> dict[int, str]:
-    """
-    Convert "3:Kitchen, 5:Bar, 8:Powder" → {3: "Kitchen", 5: "Bar", 8: "Powder"}.
-    Ignores malformed pairs.
-    """
-    out = {}
-    if not mapping_str:
-        return out
-    for pair in mapping_str.split(","):
-        p = pair.strip()
-        if not p or ":" not in p:
-            continue
-        idx, tag = p.split(":", 1)
-        try:
-            page_no = int(idx.strip())
-            tag_val = tag.strip()
-            if tag_val:
-                out[page_no] = tag_val
-        except:
-            continue
-    return out
-
-# -------- bottom-left parser: Type / QTY / Finish / Size ----------
-QTY_RE     = re.compile(r"^(?:QTY|Qty|qty)\s*:\s*(\d+)\s*$")
-FINISH_RE  = re.compile(r"^(?:Finish|FINISH)\s*:\s*(.+)$")
-SIZE_RE    = re.compile(r"^(?:Size|SIZE)\s*:\s*(.+)$")
-TYPE_RE    = re.compile(r"^(?:Type|TYPE)\s*:\s*(.+)$")
-
-def parse_bottom_left_fields(raw_text: str) -> dict:
-    """
-    Parse a bottom-left block into {Type, QTY, Finish, Size}.
-    Splits on '|' first, then on ';'. Accepts tokens like:
-      - "Pendant"  (becomes Type if no explicit Type:)
-      - "QTY: 2"
-      - "Finish: Black"
-      - "Size: 12\" x 8\""
-    Returns empty strings if not found.
+    Parse a link title string into {Type, QTY, Finish, Size}.
+    Splits on '|' and ';', then matches key:value pairs (case-insensitive).
+    If no explicit 'Type:' is present, the first standalone token becomes Type.
     """
     fields = {"Type": "", "QTY": "", "Finish": "", "Size": ""}
 
-    if not raw_text.strip():
+    if not link_text:
         return fields
 
-    # Normalize separators: treat newlines as '|'
-    s = raw_text.replace("\n", " | ")
+    # Normalize newlines to ' | ' so all separators behave the same.
+    s = (link_text or "").replace("\n", " | ")
     parts = []
     for chunk in s.split("|"):
         sub = [x.strip() for x in chunk.split(";")]
@@ -124,161 +71,155 @@ def parse_bottom_left_fields(raw_text: str) -> dict:
     if not fields["Type"]:
         for tok in parts:
             if ":" not in tok and not QTY_RE.match(tok):
-                # Avoid tokens that are just labels like "Finish" or "Size"
+                # Avoid tokens that are just labels
                 if tok.lower() not in ("finish", "size", "qty", "quantity"):
                     fields["Type"] = tok.strip()
                     break
 
     return fields
 
-def extract_selected_pages(
+def extract_links_by_pages(
     pdf_bytes: bytes,
-    selected_pages: set[int],
-    page_tags: dict[int, str],
-    bl_left_ratio: float = 0.65,  # left 65% of page width
-    bl_bottom_start: float = 0.55 # bottom area begins at 55% of page height
+    page_to_tag: dict[int, str] | None,
+    only_listed_pages: bool = True
 ) -> pd.DataFrame:
     """
-    For each selected page:
-      - bottom-left: parse into Type/QTY/Finish/Size
-      - links: every http(s) link on the page → each link = one row
-      - Tags: from page_tags mapping (or blank if not provided)
+    Extract links. If page_to_tag is given, and only_listed_pages=True,
+    process ONLY those pages and use its Tags value.
+    If page_to_tag is empty or only_listed_pages=False, process all pages
+    and apply Tags when provided for that page (else blank).
+
+    For each link, parse Type/QTY/Finish/Size from the LINK TITLE TEXT.
     """
     doc = fitz.open("pdf", pdf_bytes)
     rows = []
 
+    listed_pages = set(page_to_tag.keys()) if page_to_tag else set()
+
     for pidx, page in enumerate(doc, start=1):
-        if pidx not in selected_pages:
-            continue
+        if only_listed_pages and page_to_tag:
+            if pidx not in listed_pages:
+                continue
 
-        w, h = page.rect.width, page.rect.height
-
-        # --- Bottom-left “materials list” area ---
-        bottom_left_rect = fitz.Rect(0, h * bl_bottom_start, w * bl_left_ratio, h)
-        bl_chunks = []
-        for x0, y0, x1, y1, txt, *_ in page.get_text("blocks"):
-            r = fitz.Rect(x0, y0, x1, y1)
-            if r.intersects(bottom_left_rect):
-                t = str(txt).strip()
-                if t:
-                    bl_chunks.append(t)
-        bottom_left_text = "\n".join(bl_chunks).strip()
-        parsed = parse_bottom_left_fields(bottom_left_text)
-
-        # --- Collect links anywhere on the page ---
+        # Collect all links on this page
         page_links = []
         for lnk in page.get_links():
             uri = lnk.get("uri") or ""
             if uri.lower().startswith(("http://", "https://")):
                 rect = lnk.get("from")
-                link_text = ""
+                link_title = ""
                 if rect:
                     try:
-                        link_text = page.get_textbox(rect).strip()
+                        link_title = page.get_textbox(rect).strip()
                     except:
-                        link_text = ""
-                page_links.append((norm_url(uri), link_text))
+                        link_title = ""
+                page_links.append((norm_url(uri), link_title))
 
-        tag_value = page_tags.get(pidx, "")
+        if not page_links:
+            continue
 
-        # One row per link (with the same parsed fields + tag for that page)
-        if page_links:
-            for url, ltxt in page_links:
-                rows.append({
-                    "page": pidx,
-                    "Tags": tag_value,
-                    "Type": parsed.get("Type", ""),
-                    "QTY": parsed.get("QTY", ""),
-                    "Finish": parsed.get("Finish", ""),
-                    "Size": parsed.get("Size", ""),
-                    "link_url": url,
-                    "link_text": ltxt,
-                })
-        else:
-            # If you want to include pages that had no links, uncomment:
-            # rows.append({
-            #     "page": pidx,
-            #     "Tags": tag_value,
-            #     "Type": parsed.get("Type",""),
-            #     "QTY": parsed.get("QTY",""),
-            #     "Finish": parsed.get("Finish",""),
-            #     "Size": parsed.get("Size",""),
-            #     "link_url": "",
-            #     "link_text": "",
-            # })
-            pass
+        tag_value = (page_to_tag or {}).get(pidx, "")  # empty if not provided
+
+        for url, link_title in page_links:
+            parsed = parse_link_title_fields(link_title)
+            rows.append({
+                "page": pidx,
+                "Tags": tag_value,
+                "Type": parsed.get("Type", ""),
+                "QTY": parsed.get("QTY", ""),
+                "Finish": parsed.get("Finish", ""),
+                "Size": parsed.get("Size", ""),
+                "link_url": url,
+                "link_text": link_title,
+            })
 
     return pd.DataFrame(rows)
 
 # ========================= Streamlit UI =========================
-st.set_page_config(page_title="Canva PDF → Links with Tags & Parsed Fields", layout="wide")
-st.title("📄 Canva PDF Extractor — Selected Pages + Tags + Parsed Bottom-left (Type/QTY/Finish/Size)")
+st.set_page_config(page_title="Canva PDF → Links (Tags + fields from link title)", layout="wide")
+st.title("📄 Canva PDF Extractor — Tags per Page + Fields from Link Title")
 
 st.caption(
-    "Upload a Canva-exported PDF, choose pages, and map pages to room tags. "
-    "Output: one row per link with parsed bottom-left fields."
+    "Upload a Canva PDF, list the pages you care about with their room **Tags**, "
+    "and get one row per link. Type/QTY/Finish/Size are parsed from the link’s title text."
 )
 
 pdf_file = st.file_uploader("Upload PDF", type="pdf")
 
-# Peek page count for friendlier prompts
-num_pages_display = ""
+num_pages = None
 if pdf_file:
     try:
-        tmp_doc = fitz.open("pdf", pdf_file.getvalue())
-        num_pages_display = f"(PDF has {len(tmp_doc)} pages)"
-    except Exception:
-        num_pages_display = ""
+        _peek = fitz.open("pdf", pdf_file.getvalue())
+        num_pages = len(_peek)
+        st.info(f"PDF detected with **{num_pages}** page(s).")
+    except Exception as e:
+        st.error(f"Could not read PDF: {e}")
 
-col1, col2 = st.columns([1, 1])
-with col1:
-    pages_input = st.text_input(
-        f"Pages to extract {num_pages_display} (e.g. 1,3-5,8). Leave blank for ALL pages.",
-        value=""
+st.markdown("### Page → Tag mapping")
+st.caption("Edit the table: put a page number (1-based) and a tag (e.g., Kitchen, Bar). Add multiple rows as needed.")
+
+# Start with a single empty row for convenience
+default_df = pd.DataFrame([{"page": "", "Tags": ""}])
+
+# Editable table (user can add rows with the + button)
+mapping_df = st.data_editor(
+    default_df,
+    num_rows="dynamic",
+    use_container_width=True,
+    key="page_tag_editor",
+    column_config={
+        "page": st.column_config.TextColumn("page", help="Page number (1-based)"),
+        "Tags": st.column_config.TextColumn("Tags", help="Room name for that page"),
+    }
+)
+
+col_a, col_b = st.columns([1,1])
+with col_a:
+    only_listed = st.checkbox(
+        "Only extract pages listed above",
+        value=True,
+        help="If unchecked, the app will extract from ALL pages and apply Tags where provided."
     )
-with col2:
-    tags_input = st.text_input(
-        "Page→Tag map (e.g. 3:Kitchen, 5:Bar, 8:Powder).",
-        value=""
-    )
+with col_b:
+    st.caption("Tip: If you want to prefill, type 1..N in the 'page' column rows, leave Tags empty for pages you don’t care about.")
 
-with st.expander("Advanced (optional): tweak bottom-left region heuristics"):
-    bl_left_ratio = st.slider("Bottom-left width ratio (0.40–0.90)", 0.40, 0.90, 0.65, 0.01)
-    bl_bottom_start = st.slider("Bottom area starts at page height % (0.40–0.80)", 0.40, 0.80, 0.55, 0.01)
+run = st.button("Run extraction", type="primary", disabled=(pdf_file is None))
 
-run_btn = st.button("Run selective extract", type="primary", disabled=(pdf_file is None))
-
-if run_btn:
+if run:
     if not pdf_file:
         st.warning("Please upload a PDF first.")
     else:
+        # Build mapping dict {page_number: tag}
+        page_to_tag = {}
+        for _, row in mapping_df.iterrows():
+            p_raw = str(row.get("page", "")).strip()
+            t_raw = str(row.get("Tags", "")).strip()
+            if not p_raw:
+                continue
+            try:
+                p_no = int(p_raw)
+                if p_no >= 1 and (num_pages is None or p_no <= num_pages):
+                    # include even if Tags is empty (so you can list which pages to extract)
+                    page_to_tag[p_no] = t_raw
+            except:
+                continue
+
         pdf_bytes = pdf_file.read()
-        doc = fitz.open("pdf", pdf_bytes)
-        selected_pages = parse_page_selection(pages_input, num_pages=len(doc))
-        page_tags = parse_page_tags_map(tags_input)
 
-        # Warn if user mapped tags for pages they didn't select
-        extra_tagged = sorted(set(page_tags.keys()) - selected_pages)
-        if extra_tagged:
-            st.info(f"Note: you provided tags for pages not selected: {extra_tagged}")
-
-        with st.spinner("Extracting…"):
-            df = extract_selected_pages(
-                pdf_bytes,
-                selected_pages,
-                page_tags,
-                bl_left_ratio=bl_left_ratio,
-                bl_bottom_start=bl_bottom_start
-            )
+        with st.spinner("Extracting links and parsing fields from link titles…"):
+            df = extract_links_by_pages(pdf_bytes, page_to_tag, only_listed_pages=only_listed)
 
         if df.empty:
-            st.info("No links found on the selected pages. Try different pages or adjust the bottom-left region.")
+            if only_listed and page_to_tag:
+                st.info("No links found on the listed pages. Check page numbers or ensure links exist.")
+            else:
+                st.info("No links found. You may need to adjust your Canva export or verify the PDF contains live links.")
         else:
-            st.success(f"Extracted {len(df)} row(s) from pages: {sorted(selected_pages)}")
+            st.success(f"Extracted {len(df)} link row(s).")
             st.dataframe(df, use_container_width=True)
             st.download_button(
                 "Download CSV",
                 df.to_csv(index=False).encode("utf-8"),
-                file_name="canva_selected_pages_extract.csv",
+                file_name="canva_links_with_tags_and_fields.csv",
                 mime="text/csv"
             )
