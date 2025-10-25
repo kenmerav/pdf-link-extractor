@@ -184,19 +184,19 @@ ROOM_MAP_RAW = [
 # build a lowercase lookup dict for exact/starts-with style checks
 ROOM_MAP = {k.lower(): v for (k, v) in ROOM_MAP_RAW}
 
-def _infer_room_from_tag(tag_val: str) -> str:
+def _infer_room_from_type(type_val: str) -> str:
     """
-    Given a 'Tags' value from the page (ex: "Sink" / "Pendant" / etc.),
+    Given the parsed "Type" (ex: "Sink", "Pendant", etc.),
     return the mapped Room ("Plumbing", "Lighting", ...).
 
     Strategy:
     1. exact lowercase match
-    2. startswith match (so "Sink Faucet" still hits "Sink Faucet" first, then "Sink")
+    2. longest prefix match
     Fallback: "" (blank)
     """
-    if not tag_val:
+    if not type_val:
         return ""
-    t = tag_val.strip().lower()
+    t = type_val.strip().lower()
 
     # exact
     if t in ROOM_MAP:
@@ -209,7 +209,7 @@ def _infer_room_from_tag(tag_val: str) -> str:
             best_key = k
     return ROOM_MAP.get(best_key, "")
 
-def extract_links_by_pages(
+def extract_links_by_pages((
     pdf_bytes: bytes,
     page_to_tag: dict[int, str] | None,
     only_listed_pages: bool = True,
@@ -235,10 +235,10 @@ def extract_links_by_pages(
             position, title = split_position_and_title_start(raw)
             fields = parse_link_title_fields(title)
 
-            rows.append({
+                        rows.append({
                 "page": pidx,
                 "Tags": tag_value,
-                "Room": _infer_room_from_tag(tag_value),
+                "Room": _infer_room_from_type(fields.get("Type", "")),
                 "Position": position,
                 "Type": fields.get("Type", ""),
                 "QTY": fields.get("QTY", ""),
@@ -246,6 +246,7 @@ def extract_links_by_pages(
                 "Size": fields.get("Size", ""),
                 "link_url": uri,
                 "link_text": title,
+            })
             })
     return pd.DataFrame(rows)
 
