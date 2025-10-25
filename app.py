@@ -572,29 +572,106 @@ with tab1:
 
     st.markdown("**Page → Tags table**")
 
-    # --- Persist the Page→Tags mapping editor so it doesn't reset every rerun ---
-    # If the user already typed rows into the Page→Tags table, Streamlit stores
-    # that under session_state["page_tag_editor"]. We want to show those values
-    # instead of wiping back to an empty default_df on each rerun.
-    if "page_tag_editor" in st.session_state and isinstance(st.session_state["page_tag_editor"], (pd.DataFrame, dict)):
-        prev_map = st.session_state["page_tag_editor"]
-        if isinstance(prev_map, dict):
-            try:
-                prev_map_df = pd.DataFrame(prev_map)
-            except Exception:
-                prev_map_df = pd.DataFrame([{"page": "", "Tags": ""}])
-        else:
-            prev_map_df = prev_map.copy()
-        # enforce the two columns we care about
-        if "page" not in prev_map_df.columns:
-            prev_map_df["page"] = ""
-        if "Tags" not in prev_map_df.columns:
-            prev_map_df["Tags"] = ""
-        default_df = prev_map_df[["page", "Tags"]]
-    else:
-        default_df = pd.DataFrame([{"page": "", "Tags": ""}])
-
+    # Page → Tags table (simple live editor)
+    default_df = pd.DataFrame([{"page": "", "Tags": ""}])
     mapping_df = st.data_editor(
+        default_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="page_tag_editor",
+        column_config={
+            "page": st.column_config.TextColumn("page", help="Page number (1-based)"),
+            "Tags": st.column_config.TextColumn("Tags", help="Room name for that page"),
+        }
+    )
+
+    only_listed = st.checkbox("Only extract pages listed above", value=True)
+    pad_px = st.slider("Link capture pad (pixels)", 0, 16, 4, 1)
+    band_px = st.slider("Nearby text band (pixels)", 0, 60, 28, 2)
+
+    # We'll persist the editable table in session_state so selecting a Room
+    # doesn't force a full re-extract.
+    if "spec_df" not in st.session_state:
+        st.session_state["spec_df"] = pd.DataFrame()
+
+    run1 = st.button("Extract / Refresh Table", type="primary", disabled=(pdf_file is None), key="extract_btn")
+    if run1 and pdf_file:
+        page_to_tag = {}
+        if num_pages is None:
+            try:
+                num_pages = len(fitz.open("pdf", pdf_file.getvalue()))
+            except:
+                num_pages = None
+        for _, row in mapping_df.iterrows():
+            p_raw = str(row.get("page", "")).strip()
+            t_raw = str(row.get("Tags", "")).strip()
+            if not p_raw:
+                continue
+            try:
+                p_no = int(p_raw)
+                if p_no >= 1 and (num_pages is None or p_no <= num_pages):
+                    page_to_tag[p_no] = t_raw
+            except:
+                continue
+
+        pdf_bytes = pdf_file.read()
+        with st.spinner("Extracting links, positions & titles…"):
+            df = extract_links_by_pages(
+                pdf_bytes,
+                page_to_tag,
+                only_listed_pages=only_listed,
+                pad_px=pad_px,
+                band_px=band_px,
+            )
+        if df.empty:
+            st.info("No links found. Verify the PDF uses live hyperlinks (not just images).")
+            st.session_state["spec_df"] = pd.DataFrame()
+        else:
+            # default Room = Unassigned if blank
+            df["Room"] = df["Room"].where(df["Room"].ne(""), "Unassigned").fillna("Unassigned")
+            st.session_state["spec_df"] = df.reset_index(drop=True)
+            st.success(f"Extracted {len(df)} row(s). You can now assign Rooms below without re-running extraction.")
+
+    # Show editable grid if we have data already (from session_state)
+    if not st.session_state["spec_df"].empty:
+        st.markdown("**Assign Room per row**")
+
+        # Pull latest edits if present, normalize to DataFrame with clean index
+        raw_latest = st.session_state.get("extracted_links_editor", st.session_state["spec_df"])
+        if isinstance(raw_latest, dict):
+            try:
+                latest_df = pd.DataFrame(raw_latest)
+            except Exception:
+                latest_df = st.session_state["spec_df"].copy()
+        elif isinstance(raw_latest, pd.DataFrame):
+            latest_df = raw_latest.copy()
+        else:
+            latest_df = st.session_state["spec_df"].copy()
+        latest_df = latest_df.reset_index(drop=True)
+
+        edited_df = st.data_editor(
+            latest_df,
+            use_container_width=True,
+            num_rows="dynamic",
+            key="extracted_links_editor",
+            column_config={
+                "Room": st.column_config.SelectboxColumn(
+                    "Room",
+                    help="Assign category for this spec item",
+                    options=ROOM_CHOICES,
+                )
+            },
+        )
+
+        # Save back to session with a stable 0..N index
+        st.session_state["spec_df"] = edited_df.reset_index(drop=True)
+
+        st.download_button(
+            "Download CSV",
+            st.session_state["spec_df"].to_csv(index=False).encode("utf-8"),
+            file_name="canva_links_with_position.csv",
+            mime="text/csv",
+        )
         default_df,
         num_rows="dynamic",
         use_container_width=True,
