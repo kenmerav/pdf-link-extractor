@@ -209,7 +209,13 @@ def _infer_room_from_type(type_val: str) -> str:
             best_key = k
     return ROOM_MAP.get(best_key, "")
 
-def extract_links_by_pages((
+def extract_links_by_pages(
+    pdf_bytes: bytes,
+    page_to_tag: dict[int, str] | None,
+    only_listed_pages: bool = True,
+    pad_px: float = 4.0,
+    band_px: float = 28.0,
+) -> pd.DataFrame:
     pdf_bytes: bytes,
     page_to_tag: dict[int, str] | None,
     only_listed_pages: bool = True,
@@ -233,9 +239,9 @@ def extract_links_by_pages((
             rect = lnk.get("from")
             raw = extract_link_title_strict(page, rect, pad_px=pad_px, band_px=band_px)
             position, title = split_position_and_title_start(raw)
-            fields = parse_link_title_fields(title)
+                        fields = parse_link_title_fields(title)
 
-                        rows.append({
+            rows.append({
                 "page": pidx,
                 "Tags": tag_value,
                 "Room": _infer_room_from_type(fields.get("Type", "")),
@@ -247,7 +253,7 @@ def extract_links_by_pages((
                 "link_url": uri,
                 "link_text": title,
             })
-            })
+
     return pd.DataFrame(rows)
 
 # ========================= Tabs 2/3: Your Firecrawl + parsers =========================
