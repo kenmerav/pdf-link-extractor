@@ -586,7 +586,12 @@ with tab1:
     pad_px = st.slider("Link capture pad (pixels)", 0, 16, 4, 1)
     band_px = st.slider("Nearby text band (pixels)", 0, 60, 28, 2)
 
-    run1 = st.button("Extract", type="primary", disabled=(pdf_file is None), key="extract_btn")
+    # We'll persist the editable table in session_state so selecting a Room
+    # doesn't force a full re-extract.
+    if "spec_df" not in st.session_state:
+        st.session_state["spec_df"] = pd.DataFrame()
+
+    run1 = st.button("Extract / Refresh Table", type="primary", disabled=(pdf_file is None), key="extract_btn")
     if run1 and pdf_file:
         page_to_tag = {}
         if num_pages is None:
@@ -617,33 +622,38 @@ with tab1:
             )
         if df.empty:
             st.info("No links found. Verify the PDF uses live hyperlinks (not just images).")
+            st.session_state["spec_df"] = pd.DataFrame()
         else:
-            st.success(f"Extracted {len(df)} row(s).")
-
             # default Room = Unassigned if blank
             df["Room"] = df["Room"].where(df["Room"].ne(""), "Unassigned").fillna("Unassigned")
+            st.session_state["spec_df"] = df.reset_index(drop=True)
+            st.success(f"Extracted {len(df)} row(s). You can now assign Rooms below without re-running extraction.")
 
-            # Editable grid with dropdown for Room
-            edited_df = st.data_editor(
-                df,
-                use_container_width=True,
-                num_rows="dynamic",
-                key="extracted_links_editor",
-                column_config={
-                    "Room": st.column_config.SelectboxColumn(
-                        "Room",
-                        help="Assign category for this spec item",
-                        options=ROOM_CHOICES,
-                    )
-                },
-            )
+    # Show editable grid if we have data already (from session_state)
+    if not st.session_state["spec_df"].empty:
+        st.markdown("**Assign Room per row**")
+        edited_df = st.data_editor(
+            st.session_state["spec_df"],
+            use_container_width=True,
+            num_rows="dynamic",
+            key="extracted_links_editor",
+            column_config={
+                "Room": st.column_config.SelectboxColumn(
+                    "Room",
+                    help="Assign category for this spec item",
+                    options=ROOM_CHOICES,
+                )
+            },
+        )
+        # update session with user's edits so scrolling/changes persist
+        st.session_state["spec_df"] = edited_df
 
-            st.download_button(
-                "Download CSV",
-                edited_df.to_csv(index=False).encode("utf-8"),
-                file_name="canva_links_with_position.csv",
-                mime="text/csv",
-            )
+        st.download_button(
+            "Download CSV",
+            edited_df.to_csv(index=False).encode("utf-8"),
+            file_name="canva_links_with_position.csv",
+            mime="text/csv",
+        )
 
 with tab2:
     st.caption("Provide a CSV with a 'Product URL' column (or the 2nd column will be used).")
