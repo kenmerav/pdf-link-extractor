@@ -235,18 +235,17 @@ def extract_links_by_pages(
             position, title = split_position_and_title_start(raw)
             fields = parse_link_title_fields(title)
 
-                        rows.append({
+            rows.append({
                 "page": pidx,
                 "Tags": tag_value,
                 "Room": _infer_room_from_tag(tag_value),
                 "Position": position,
-                "Type": fields.get("Type",""),
-                "QTY": fields.get("QTY",""),
-                "Finish": fields.get("Finish",""),
-                "Size": fields.get("Size",""),
+                "Type": fields.get("Type", ""),
+                "QTY": fields.get("QTY", ""),
+                "Finish": fields.get("Finish", ""),
+                "Size": fields.get("Size", ""),
                 "link_url": uri,
                 "link_text": title,
-            }
             })
     return pd.DataFrame(rows)
 
