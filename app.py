@@ -632,8 +632,14 @@ with tab1:
     # Show editable grid if we have data already (from session_state)
     if not st.session_state["spec_df"].empty:
         st.markdown("**Assign Room per row**")
+
+        # 1. Prefer the most recent edits from the data_editor widget itself,
+        #    so selections don't snap back to 'Unassigned' on rerun.
+        latest_df = st.session_state.get("extracted_links_editor", st.session_state["spec_df"])
+
+        # 2. Render editor using the latest_df so reruns preserve choices
         edited_df = st.data_editor(
-            st.session_state["spec_df"],
+            latest_df,
             use_container_width=True,
             num_rows="dynamic",
             key="extracted_links_editor",
@@ -645,10 +651,17 @@ with tab1:
                 )
             },
         )
-        # update session with user's edits so scrolling/changes persist
+
+        # 3. Save updated edits back into session so future reruns keep them
         st.session_state["spec_df"] = edited_df
 
+        # 4. Download button uses what you're actually seeing now
         st.download_button(
+            "Download CSV",
+            edited_df.to_csv(index=False).encode("utf-8"),
+            file_name="canva_links_with_position.csv",
+            mime="text/csv",
+        )
             "Download CSV",
             edited_df.to_csv(index=False).encode("utf-8"),
             file_name="canva_links_with_position.csv",
