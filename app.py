@@ -1,36 +1,75 @@
-# app.py — Full app:
-# 1) Canva PDF → Page→Tags + strict per-link title capture + Position + Type/QTY/Finish/Size
-# 2) Enrich CSV (Firecrawl v2 → bs4 fallback) to get image URL + price
+# app.py — Firecrawl-hybrid (render=True + aggressive + domain parsers)
+# Tabs:
+# 1) Extract links from PDF (simple extractor)
+# 2) Enrich CSV (Firecrawl v2 simple→gentle→aggressive, then domain parsers, then generic bs4)
 # 3) Test a single URL
-# Includes hardened Lumens handler.
 
-import os, re, json, time, requests
+import os, io, json, re, time, random, requests
 from typing import Optional, Tuple
 import streamlit as st
 import fitz  # PyMuPDF
 import pandas as pd
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, urlunparse, urljoin, parse_qsl, urlencode
+from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-# ========================= App setup =========================
-st.set_page_config(page_title="Spec Link Toolkit", layout="wide")
-st.title("🧰 Spec Link Toolkit")
+# ===================== Streamlit setup =====================
+st.set_page_config(page_title="Spec Link Extractor & Enricher (Firecrawl-hybrid)", layout="wide")
+st.title("🧰 Spec Link Extractor & Enricher — Firecrawl Hybrid")
 
+# ===================== Helpers =====================
 PRICE_RE = re.compile(r"\$\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?")
-UA = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
-}
+UA = {"User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
 
-def requests_get(url: str, timeout: int = 20, retries: int = 2) -> Optional[requests.Response]:
-    for _ in range(retries + 1):
+def requests_get(url: str, timeout: int = 25, retries: int = 2) -> Optional[requests.Response]:
+    for _ in range(retries+1):
         try:
             r = requests.get(url, headers=UA, timeout=timeout)
             if 200 <= r.status_code < 300:
                 return r
         except Exception:
             pass
-        time.sleep(0.25)
+        time.sleep(0.35 + 0.3*random.random())
     return None
+
+def canonicalize_url(u: str) -> str:
+    """Remove tracking params; keep canonical path."""
+    try:
+        p = urlparse(u)
+        q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+             if not k.lower().startswith(("utm_", "gclid", "gbraid", "wbraid", "msclkid", "mc_"))]
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q), ""))
+    except Exception:
+        return u
+
+def add_cache_buster(u: str) -> str:
+    """Add a throwaway param so Firecrawl won't return a cached render."""
+    try:
+        p = urlparse(u)
+        q = dict(parse_qsl(p.query, keep_blank_values=True))
+        q["_fcv"] = str(int(time.time()*1000))
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q), ""))
+    except Exception:
+        return u
+
+def best_from_srcset(srcset_value: str) -> str:
+    best_url, best_w = "", -1
+    for part in (srcset_value or "").split(","):
+        s = part.strip()
+        if not s:
+            continue
+        pieces = s.split()
+        url = pieces[0]
+        w = -1
+        if len(pieces) > 1 and pieces[1].endswith("w"):
+            try:
+                w = int(pieces[1][:-1])
+            except Exception:
+                w = -1
+        if w > best_w:
+            best_w, best_url = w, url
+    return best_url
 
 class Timer:
     def __enter__(self):
@@ -39,268 +78,120 @@ class Timer:
     def __exit__(self, *exc):
         self.dt = time.perf_counter() - self.t0
 
-
-# ========================= TAB 1: Canva PDF extractor =========================
-# Parsing rules for Type / QTY / Finish / Size
-QTY_RE     = re.compile(r"^(?:QTY|Qty|qty|Quantity)\s*:\s*([0-9Xx]+)\s*$")
-FINISH_RE  = re.compile(r"^(?:FINISH|Finish)\s*:\s*(.+)$")
-SIZE_RE    = re.compile(r"^(?:SIZE|Size|Dimensions?)\s*:\s*(.+)$")
-TYPE_RE    = re.compile(r"^(?:TYPE|Type)\s*:\s*(.+)$")
-
-def parse_link_title_fields(link_text: str) -> dict:
-    """
-    Parse 'PENDANT | QTY: 1 | FINISH: Brass, White | SIZE: 48"' style strings.
-    Accepts pipes or semicolons. Infers Type from first unlabeled token if needed.
-    """
-    fields = {"Type": "", "QTY": "", "Finish": "", "Size": ""}
-    s = (link_text or "").replace("\n", " | ").strip()
-    if not s:
-        return fields
-
-    parts = []
-    for chunk in s.split("|"):
-        subs = [x.strip() for x in chunk.split(";")]
-        parts.extend([x for x in subs if x])
-
-    for tok in parts:
-        m = TYPE_RE.match(tok)
-        if m and not fields["Type"]:
-            fields["Type"] = m.group(1).strip(); continue
-        m = QTY_RE.match(tok)
-        if m and not fields["QTY"]:
-            q = m.group(1).strip()
-            fields["QTY"] = "" if q.upper() == "XX" else q
-            continue
-        m = FINISH_RE.match(tok)
-        if m and not fields["Finish"]:
-            fields["Finish"] = m.group(1).strip(); continue
-        m = SIZE_RE.match(tok)
-        if m and not fields["Size"]:
-            fields["Size"] = m.group(1).strip(); continue
-
-    if not fields["Type"]:
-        for tok in parts:
-            if ":" in tok:
-                continue
-            if tok.strip():
-                fields["Type"] = tok.strip()
-                break
-
-    if fields["Size"]:
-        fields["Size"] = re.sub(r"\s*[xX]\s*", " x ", fields["Size"]).strip()
-
-    return fields
-
-# STRICT per-link text capture: only words whose CENTER lies inside link box
-def extract_link_title_strict(page, rect, pad_px: float = 2.0, band_px: float = 18.0) -> str:
-    """
-    Capture text for this link only.
-    - Primary: words whose center lies inside (rect ± pad_px)
-    - If empty: look in a thin horizontal band around the rect (for cases where
-      the link is only on an image or underline but the label sits just outside).
-    - Words are taken from raw block->line->span order for stable layout order.
-    """
-    import fitz as _fitz
-    def norm(s: str) -> str:
-        s = re.sub(r"\s*\|\s*", " | ", s)
-        s = re.sub(r"\s*;\s*", "; ", s)
-        s = re.sub(r"\s{2,}", " ", s)
-        return s.strip()
-
-    if not rect:
-        return ""
-
-    r = _fitz.Rect(rect).normalize()
-    R = _fitz.Rect(r.x0 - pad_px, r.y0 - pad_px, r.x1 + pad_px, r.y1 + pad_px)
-
-    raw = page.get_text("rawdict") or {}
-    words = []
-    for blk in raw.get("blocks", []):
-        if blk.get("type") != 0:
-            continue
-        for line in blk.get("lines", []):
-            for span in line.get("spans", []):
-                tx = span.get("text", "")
-                bbox = span.get("bbox", None)
-                if not tx or not bbox:
-                    continue
-                x0, y0, x1, y1 = bbox
-                cx = (x0 + x1) / 2.0
-                cy = (y0 + y1) / 2.0
-                words.append((cx, cy, x0, y0, x1, y1, tx))
-
-    kept = [(y0, x0, tx) for cx, cy, x0, y0, x1, y1, tx in words
-            if R.contains(_fitz.Point(cx, cy)) and tx]
-
-    if not kept:
-        band = _fitz.Rect(r.x0, r.y0 - band_px, r.x1, r.y1 + band_px)
-        kept = []
-        for cx, cy, x0, y0, x1, y1, tx in words:
-            if not tx:
-                continue
-            cy_in = (band.y0 <= cy <= band.y1)
-            x_overlaps = not (x1 < r.x0 or x0 > r.x1)
-            if cy_in and x_overlaps:
-                kept.append((y0, x0, tx))
-
-    if not kept:
-        return ""
-
-    kept.sort(key=lambda t: (round(t[0], 3), t[1]))
-    return norm(" ".join(t[2] for t in kept))
-
-# Position is only at the START of this link’s text (we do not read past the link)
-POS_AT_START = re.compile(r'^\s*(\d{1,3})[.\u2024\u00B7]?\s*')
-# next bullet *inside* a captured string (to trim accidental merges)
-NEXT_BULLET = re.compile(r'\s(\d{1,3})[.\u2024\u00B7](?=\s|[A-Z])')
-
-def split_position_and_title_start(raw: str) -> tuple[str, str]:
-    """
-    Pull Position at the start of this link's text; if another bullet appears
-    later in the same string, cut at that bullet to avoid merging.
-    """
-    s = (raw or "").strip()
-    if not s:
-        return "", ""
-    m = POS_AT_START.match(s)
-    if not m:
-        return "", s
-    pos = m.group(1)
-    rest = s[m.end():].strip()
-    m2 = NEXT_BULLET.search(rest)
-    if m2:
-        rest = rest[:m2.start()].strip()
-    return pos, rest
-
-def extract_links_by_pages(
-    pdf_bytes: bytes,
-    page_to_tag: dict[int, str] | None,
-    only_listed_pages: bool = True,
-    pad_px: float = 2.0,
-    band_px: float = 18.0,
-    require_leading_number: bool = False,
-) -> pd.DataFrame:
+# ===================== PDF → Links extractor (simple) =====================
+def extract_links_from_pdf(pdf_bytes: bytes) -> pd.DataFrame:
+    """Extract links + simple titles from uploaded PDF."""
     doc = fitz.open("pdf", pdf_bytes)
     rows = []
-    listed = set(page_to_tag.keys()) if page_to_tag else set()
-
-    for pidx, page in enumerate(doc, start=1):
-        if only_listed_pages and page_to_tag and pidx not in listed:
-            continue
-        tag_value = (page_to_tag or {}).get(pidx, "")
-
+    for page in doc:
         for lnk in page.get_links():
-            uri = (lnk.get("uri") or "").strip()
-            if not uri.lower().startswith(("http://", "https://")):
+            uri = lnk.get('uri') or ''
+            if not uri.startswith(('http://', 'https://')):
                 continue
-
-            rect = lnk.get("from")
-            raw = extract_link_title_strict(page, rect, pad_px=pad_px, band_px=band_px)
-            position, title = split_position_and_title_start(raw)
-
-            if require_leading_number and not position:
-                continue
-
-            fields = parse_link_title_fields(title)
-
+            rect = lnk.get('from')
+            title = ""
+            if rect:
+                try:
+                    title = page.get_textbox(fitz.Rect(rect)).strip()
+                except Exception:
+                    title = ""
             rows.append({
-                "page": pidx,
-                "Tags": tag_value,
-                "Position": position,
-                "Type": fields.get("Type",""),
-                "QTY": fields.get("QTY",""),
-                "Finish": fields.get("Finish",""),
-                "Size": fields.get("Size",""),
-                "link_url": uri,     # full URL
-                "link_text": title,  # per-link, trimmed if a next bullet was detected
+                'Product Name': title,
+                'Product URL': uri,
             })
-
     return pd.DataFrame(rows)
 
+# ===================== Scene7 helpers (Lumens/Crate/CB2) =====================
+def _update_query(url: str, add: dict, remove_keys: tuple = ()) -> str:
+    p = urlparse(url)
+    q = dict(parse_qsl(p.query, keep_blank_values=True))
+    for k in remove_keys:
+        q.pop(k, None)
+    q.update({k: str(v) for k, v in add.items()})
+    return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q), ""))
 
-# ========================= TAB 2/3: Enricher (Firecrawl v2 + bs4) =========================
-def firecrawl_scrape_v2(url: str, api_key: str, mode: str = "simple") -> dict:
-    if not api_key:
-        return {}
-    payload = {
-        "url": url,
-        "formats": [
-            "html",
-            {"type":"json","schema":{"type":"object","properties":{"price":{"type":"string"}},"required":[]}}
-        ],
-        "proxy":"auto",
-        "timeout": 45000,
-        "device":"desktop"
-    }
-    if mode == "gentle":
-        payload["actions"] = [
-            {"type":"wait","milliseconds":800},
-            {"type":"scroll","y":1200},
-            {"type":"wait","milliseconds":1000},
-        ]
+def _strip_scene7_preset(url: str) -> str:
+    if "?" not in url: return url
+    path, q = url.split("?", 1)
+    q = q.strip()
+    # remove $Preset$ tokens if present
+    if q.startswith("$") and q.endswith("$"):
+        return path
+    if "$" in q:
+        parts = [p for p in q.split("&") if not (p.startswith("$") and p.endswith("$"))]
+        q = "&".join(parts)
+        return f"{path}?{q}" if q else path
+    return url
+
+def _measure_image_dims(url: str, timeout: int = 10) -> tuple[int, int]:
+    """Best-effort: stream some bytes and let Pillow read size; bail if too big."""
     try:
-        r = requests.post(
-            "https://api.firecrawl.dev/v2/scrape",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type":"application/json"},
-            json=payload, timeout=75
-        )
-        if r.status_code >= 400:
-            return {}
-        return r.json()
-    except Exception:
-        return {}
-
-def parse_image_and_price_from_v2(scrape: dict) -> Tuple[str, str, str]:
-    if not scrape:
-        return "", "", ""
-    data = scrape.get("data") or {}
-    meta = data.get("metadata") or {}
-    html = data.get("html") or ""
-    img = meta.get("og:image") or meta.get("twitter:image") or meta.get("image") or ""
-    price = ""
-    j = data.get("json")
-    if isinstance(j, dict):
-        content = j.get("content") if isinstance(j.get("content"), dict) else j
-        if isinstance(content, dict):
-            price = (content.get("price") or "").strip()
-    if (not price) and html:
-        soup = BeautifulSoup(html, "lxml")
-        for tag in soup.find_all("script", type="application/ld+json"):
+        r = requests.get(url, headers=UA, stream=True, timeout=timeout)
+        r.raise_for_status()
+        bio = io.BytesIO()
+        for chunk in r.iter_content(8192):
+            if not chunk: break
+            bio.write(chunk)
             try:
-                obj = json.loads(tag.string or "")
+                bio.seek(0)
+                with Image.open(bio) as im:
+                    im.load()
+                    return im.size
             except Exception:
-                continue
-            objs = obj if isinstance(obj, list) else [obj]
-            for o in objs:
-                t = o.get("@type")
-                if t == "Product" or (isinstance(t, list) and "Product" in t):
-                    offers = o.get("offers") or {}
-                    if isinstance(offers, list): offers = offers[0] if offers else {}
-                    p = offers.get("price") or (offers.get("priceSpecification") or {}).get("price")
-                    if p:
-                        price = p if str(p).startswith("$") else f"${p}"
-                        break
-            if price:
-                break
-        if not img:
-            m = soup.find("meta", attrs={"property":"og:image"}) or soup.find("meta", attrs={"name":"og:image"})
-            if m and m.get("content"):
-                img = m["content"]
-        if not price:
-            m = PRICE_RE.search(soup.get_text(" ", strip=True))
-            if m:
-                price = m.group(0)
-    return img or "", price or "", html or ""
+                if bio.tell() > 4 * 1024 * 1024:  # stop early on huge images
+                    break
+        bio.seek(0)
+        with Image.open(bio) as im:
+            im.load(); return im.size
+    except Exception:
+        return (0, 0)
 
+def lumens_upgrade_scene7_url(url: str) -> str:
+    """Try to upsize Lumens Scene7 images to a large, clean variant."""
+    if not isinstance(url, str) or "is/image" not in url or "lumens" not in url.lower():
+        return url
+    candidates = [url]
+    no_preset = _strip_scene7_preset(url)
+    candidates.append(no_preset)
+    for wid in (2400, 3000, 4000):
+        candidates.append(_update_query(no_preset, {"wid": wid, "qlt": 95, "fmt": "jpg"}))
+        candidates.append(_update_query(no_preset, {"wid": wid, "qlt": 95, "fmt": "jpg", "scl": 1}))
+    best_url, best_w, best_h = url, -1, -1
+    for cand in dict.fromkeys(candidates):  # de-dupe
+        w, h = _measure_image_dims(cand)
+        if w > best_w or (w == best_w and h > best_h):
+            best_url, best_w, best_h = cand, w, h
+    return best_url
+
+def scene7_upgrade_generic(url: str) -> str:
+    """Upsize Crate/CB2 Scene7 images."""
+    if not isinstance(url, str) or "is/image" not in url:
+        return url
+    if not any(k in url.lower() for k in ("crateandbarrel", "crate", "cb2", "scene7")):
+        return url
+    base = url.split("?", 1)[0]
+    candidates = [url, base]
+    for wid in (2400, 3000, 4000):
+        candidates.append(_update_query(base, {"wid": wid, "qlt": 95, "fmt": "jpg"}))
+        candidates.append(_update_query(base, {"wid": wid, "qlt": 95, "fmt": "jpg", "scl": 1}))
+    best, bw, bh = url, -1, -1
+    for cand in dict.fromkeys(candidates):
+        w, h = _measure_image_dims(cand)
+        if w > bw or (w == bw and h > bh):
+            best, bw, bh = cand, w, h
+    return best
+
+# ===================== Pure-Requests Parsers =====================
 def pick_image_and_price_bs4(html: str, base_url: str) -> Tuple[str, str]:
+    """Generic: OG/Twitter → JSON-LD → first <img>; price via JSON-LD/meta/visible."""
     soup = BeautifulSoup(html or "", "lxml")
-    img = ""
+    img_url = ""
     for sel in [("meta", {"property":"og:image"}), ("meta", {"name":"og:image"}),
                 ("meta", {"name":"twitter:image"}), ("meta", {"property":"twitter:image"})]:
         tag = soup.find(*sel)
         if tag and tag.get("content"):
-            img = urljoin(base_url, tag["content"]); break
-    if not img:
+            img_url = urljoin(base_url, tag["content"]); break
+    if not img_url:
         for tag in soup.find_all("script", type="application/ld+json"):
             try:
                 data = json.loads(tag.string or "")
@@ -310,15 +201,15 @@ def pick_image_and_price_bs4(html: str, base_url: str) -> Tuple[str, str]:
                     if t == "Product" or (isinstance(t, list) and "Product" in t):
                         im = obj.get("image")
                         if isinstance(im, list) and im:
-                            img = urljoin(base_url, im[0]); break
+                            img_url = urljoin(base_url, im[0]); break
                         if isinstance(im, str) and im:
-                            img = urljoin(base_url, im); break
-                if img: break
+                            img_url = urljoin(base_url, im); break
+                if img_url: break
             except Exception:
                 pass
-    if not img:
+    if not img_url:
         anyimg = soup.find("img", src=True)
-        if anyimg: img = urljoin(base_url, anyimg["src"])
+        if anyimg: img_url = urljoin(base_url, anyimg["src"])
 
     price = ""
     for tag in soup.find_all("script", type="application/ld+json"):
@@ -338,227 +229,209 @@ def pick_image_and_price_bs4(html: str, base_url: str) -> Tuple[str, str]:
         except Exception:
             pass
     if not price:
-        meta_price = soup.find("meta", attrs={"itemprop":"price"}) or soup.find("meta", attrs={"property":"product:price:amount"})
+        meta_price = soup.find("meta", attrs={"itemprop":"price"}) or \
+                     soup.find("meta", attrs={"property":"product:price:amount"})
         if meta_price and meta_price.get("content"):
             val = meta_price["content"]
             price = f"${val}" if not str(val).startswith("$") else str(val)
     if not price:
         m = PRICE_RE.search(soup.get_text(" ", strip=True))
         if m: price = m.group(0)
-    return img or "", price or ""
+    return img_url or "", price or ""
 
-def enrich_domain_firecrawl_v2(url: str, api_key: str) -> Tuple[str, str, str]:
-    sc = firecrawl_scrape_v2(url, api_key, mode="simple")
-    img, price, _ = parse_image_and_price_from_v2(sc)
-    status = "fc_simple"
-    if not img or not price:
-        sc2 = firecrawl_scrape_v2(url, api_key, mode="gentle")
-        i2, p2, _ = parse_image_and_price_from_v2(sc2)
-        img = img or i2; price = price or p2
-        if i2 or p2: status = "fc_gentle"
-    return img, price, status
+# ----- Lumens specific (PDP-large pattern + lazy) -----
+LUMENS_PDP_RE = re.compile(
+    r'https://images\.lumens\.com/is/image/Lumens/[A-Za-z0-9_/-]+?\?\$Lumens\.com-PDP-large\$', re.I
+)
 
-
-# ========================= LUMENS — hardened path =========================
-def _canonicalize_lumens(u: str) -> str:
-    """Strip tracking params; keep color/variant if present."""
-    try:
-        p = urlparse(u)
-        keep = []
-        for k, v in parse_qsl(p.query, keep_blank_values=True):
-            if k.lower().startswith(("dwvar_", "sku", "variant")):
-                keep.append((k, v))
-        return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(keep), ""))
-    except Exception:
-        return u
-
-def _best_from_srcset(ss: str) -> str:
-    best_url, best_w = "", -1
-    for part in (ss or "").split(","):
-        p = part.strip().split()
-        if not p: 
-            continue
-        url = p[0]
-        w = -1
-        if len(p) > 1 and p[1].endswith("w"):
-            try:
-                w = int(p[1][:-1])
-            except Exception:
-                pass
-        if w > best_w:
-            best_w, best_url = w, url
-    return best_url
-
-def _lumens_image_from_html(html: str) -> str:
-    """Prefer images.lumens.com is/image URL; fall back to hero <picture>/<img>."""
-    if not html:
-        return ""
-    soup = BeautifulSoup(html, "lxml")
-
-    # 1) <meta> og/twitter
-    for sel in [
-        ("meta", {"property": "og:image"}),
-        ("meta", {"name": "og:image"}),
-        ("meta", {"name": "twitter:image"}),
-        ("meta", {"property": "twitter:image"}),
-    ]:
-        tag = soup.find(*sel)
-        if tag and tag.get("content"):
-            v = tag["content"].strip()
-            if v:
-                return v
-
-    # 2) JSON-LD Product.image
+def parse_image_and_price_lumens(html: str, base_url: str) -> Tuple[str, str]:
+    soup = BeautifulSoup(html or "", "lxml")
+    text = html or ""
+    img = ""
+    m = LUMENS_PDP_RE.search(text)
+    if m: img = m.group(0)
+    if not img:
+        for im in soup.find_all("img"):
+            for attr in ("data-src", "data-original", "data-zoom-image", "data-large_image", "src"):
+                v = im.get(attr)
+                if isinstance(v, str) and "$Lumens.com-PDP-large$" in v:
+                    img = v; break
+            if img: break
+        if not img:
+            for src in soup.select("picture source[srcset], source[srcset]"):
+                ss = src.get("srcset") or src.get("data-srcset")
+                if isinstance(ss, str) and "$Lumens.com-PDP-large$" in ss:
+                    cand = best_from_srcset(ss)
+                    if cand: img = cand; break
+    price = ""
     for tag in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(tag.string or "")
-            items = data if isinstance(data, list) else [data]
-            for obj in items:
-                t = obj.get("@type")
-                if t == "Product" or (isinstance(t, list) and "Product" in t):
-                    img = obj.get("image")
-                    if isinstance(img, list) and img:
-                        return img[0]
-                    if isinstance(img, str) and img:
-                        return img
         except Exception:
-            pass
-
-    # 3) Prefer Lumens dynamic server “is/image”
-    for imgtag in soup.find_all("img"):
-        cand = (
-            imgtag.get("data-enlarged") or
-            imgtag.get("data-zoom-image") or
-            imgtag.get("data-large_image") or
-            imgtag.get("data-src") or
-            imgtag.get("src") or
-            ""
-        )
-        if "images.lumens.com/is/image" in (cand or ""):
-            return cand
-
-        ss = imgtag.get("srcset") or imgtag.get("data-srcset")
-        if ss:
-            best = _best_from_srcset(ss)
-            if "images.lumens.com/is/image" in best:
-                return best
-
-    # 4) <picture><source srcset>
-    best_url = ""
-    best_score = -1
-    for pic in soup.find_all("picture"):
-        cand = ""
-        for src in pic.find_all("source"):
-            b = _best_from_srcset(src.get("srcset") or "")
-            if b:
-                cand = b
-        if not cand:
             continue
-        score = 0
-        cstr = " ".join((pic.get("id") or "", " ".join(pic.get("class") or []))).lower()
-        if any(k in cstr for k in ("pdp", "product", "hero", "main", "gallery")):
-            score += 5
-        if "images.lumens.com/is/image" in cand:
-            score += 3
-        if score > best_score:
-            best_score, best_url = score, cand
-    if best_url:
-        return best_url
+        objs = data if isinstance(data, list) else [data]
+        for o in objs:
+            t = o.get("@type")
+            if t == "Product" or (isinstance(t, list) and "Product" in t):
+                offers = o.get("offers") or {}
+                if isinstance(offers, list): offers = offers[0] if offers else {}
+                p = offers.get("price") or (offers.get("priceSpecification") or {}).get("price")
+                if p:
+                    price = p if str(p).startswith("$") else f"${p}"
+                    break
+        if price: break
+    if not price:
+        meta_price = soup.find("meta", attrs={"itemprop":"price"}) or soup.find("meta", attrs={"property": "product:price:amount"})
+        if meta_price and meta_price.get("content"):
+            val = meta_price["content"]
+            price = val if str(val).startswith("$") else f"${val}"
+    if not price:
+        m = PRICE_RE.search(soup.get_text(" ", strip=True))
+        if m: price = m.group(0)
+    if img and "images.lumens.com/is/image" in img:
+        img = lumens_upgrade_scene7_url(img)
+    return img or "", price or ""
 
-    # 5) Fallback first <img>
-    anyimg = soup.find("img", src=True)
-    return anyimg["src"].strip() if anyimg else ""
+# ----- Wayfair specific: __NEXT_DATA__ + wfcdn fallback -----
+def parse_wayfair_next_data(html: str) -> Tuple[str, str]:
+    if not html: return "", ""
+    soup = BeautifulSoup(html, "lxml")
+    tag = soup.find("script", id="__NEXT_DATA__", type="application/json")
+    if not tag or not tag.string: return "", ""
+    try:
+        data = json.loads(tag.string)
+    except Exception:
+        return "", ""
+    img = ""
+    price = ""
+    # Heuristics: search for any object with wfcdn image and price-ish fields
+    def walk(o):
+        if isinstance(o, dict):
+            yield o
+            for v in o.values(): yield from walk(v)
+        elif isinstance(o, list):
+            for v in o: yield from walk(v)
+    for node in walk(data):
+        # image signals
+        for k in ("image", "imageUrl", "src", "url"):
+            v = node.get(k)
+            if isinstance(v, str) and ("wfcdn" in v or v.endswith(".jpg") or v.endswith(".png")):
+                img = img or v
+        # price signals
+        for k in ("price", "salePrice", "currentPrice", "displayPrice", "minPrice", "maxPrice"):
+            v = node.get(k)
+            if isinstance(v, (str, int, float)):
+                s = str(v)
+                m = PRICE_RE.search(s.replace("USD", "$"))
+                if m:
+                    price = price or m.group(0)
+        if img and price:
+            break
+    return img, price
 
-def firecrawl_scrape_v2_aggressive(url: str, api_key: str) -> dict:
-    """Aggressive Firecrawl with waits + JS evaluate to pull lazy/srcset/enlarged."""
+def parse_image_and_price_wayfair(html: str, base_url: str) -> Tuple[str, str]:
+    img = price = ""
+    i_nx, p_nx = parse_wayfair_next_data(html)
+    if i_nx: img = i_nx
+    if p_nx: price = p_nx
+    if not img or not price:
+        soup = BeautifulSoup(html or "", "lxml")
+        if not img and soup:
+            best, bestw = "", -1
+            for im in soup.find_all("img"):
+                v = im.get("src") or im.get("data-src") or ""
+                if isinstance(v, str) and "wfcdn" in v:
+                    best = v; bestw = max(bestw, 9999)
+                ss = im.get("srcset") or im.get("data-srcset")
+                if isinstance(ss, str) and "wfcdn" in ss:
+                    for part in ss.split(","):
+                        s = part.strip()
+                        if not s: continue
+                        parts = s.split()
+                        u = parts[0]; w = -1
+                        if len(parts) > 1 and parts[1].endswith("w"):
+                            try: w = int(parts[1][:-1])
+                            except: w = -1
+                        if w > bestw:
+                            bestw, best = w, u
+            if best: img = best
+        if not price and soup:
+            m = PRICE_RE.search(soup.get_text(" ", strip=True))
+            if m: price = m.group(0)
+    return img or "", price or ""
+
+# ----- Crate & Barrel / CB2 -----
+def parse_image_and_price_crate_cb2(html: str, base_url: str) -> Tuple[str, str]:
+    soup = BeautifulSoup(html or "", "lxml")
+    img = ""
+    price = ""
+    m = soup.find("meta", attrs={"property":"og:image"}) or soup.find("meta", attrs={"name":"og:image"}) if soup else None
+    if m and m.get("content"): img = m["content"]
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            obj = json.loads(tag.string or "")
+        except Exception:
+            continue
+        arr = obj if isinstance(obj, list) else [obj]
+        for o in arr:
+            t = o.get("@type")
+            if t == "Product" or (isinstance(t, list) and "Product" in t):
+                im = o.get("image")
+                if not img:
+                    if isinstance(im, list) and im: img = im[0]
+                    elif isinstance(im, str) and im: img = im
+                offers = o.get("offers") or {}
+                if isinstance(offers, list): offers = offers[0] if offers else {}
+                p = offers.get("price") or (offers.get("priceSpecification") or {}).get("price")
+                if p and not price:
+                    price = p if str(p).startswith("$") else f"${p}"
+        if img and price: break
+    if soup and not img:
+        for imgtag in soup.find_all("img"):
+            for attr in ("data-src", "src", "data-zoom-image"):
+                v = imgtag.get(attr)
+                if isinstance(v, str) and "/is/image/" in v:
+                    img = v; break
+            if img: break
+    if not price and soup:
+        m = PRICE_RE.search(soup.get_text(" ", strip=True))
+        if m: price = m.group(0)
+    if img and "/is/image/" in img:
+        img = scene7_upgrade_generic(img)
+    return img or "", price or ""
+
+# ===================== Firecrawl v2 (render=True) =====================
+def firecrawl_scrape_v2(url: str, api_key: str, mode: str = "simple") -> dict:
+    """Call Firecrawl /v2/scrape with render=True."""
     if not api_key:
         return {}
     payload = {
         "url": url,
         "formats": [
             "html",
-            {"type": "json", "schema": {"type": "object", "properties": {"price": {"type": "string"}}, "required": []}}
+            "markdown",
+            {"type": "json", "schema": {
+                "type": "object",
+                "properties": {"price": {"type": "string"}},
+                "required": []
+            }}
         ],
-        "render": True,
-        "device": "desktop",
         "proxy": "auto",
-        "timeout": 60000,
-        "actions": [
-            {"type": "wait", "milliseconds": 900},
-            {"type": "scroll", "y": 1200},
-            {"type": "wait", "milliseconds": 900},
-            {"type": "waitForSelector", "selector": "picture source[srcset], img[data-src], img[srcset], img[data-enlarged], img[src]", "timeout": 8000},
-            {
-                "type": "evaluate",
-                "script": """
-                (() => {
-                  function bestFromSrcset(ss) {
-                    if (!ss) return "";
-                    let best = ["", -1];
-                    ss.split(",").forEach(part => {
-                      const p = part.trim().split(/\\s+/);
-                      const url = p[0] || "";
-                      let w = -1;
-                      if (p[1] && /w$/.test(p[1])) {
-                        const n = parseInt(p[1].slice(0, -1), 10);
-                        if (!isNaN(n)) w = n;
-                      }
-                      if (w > best[1]) best = [url, w];
-                    });
-                    return best[0];
-                  }
-                  const out = { images: [], price: "" };
-                  document.querySelectorAll('meta[property="og:image"],meta[name="og:image"],meta[name="twitter:image"]').forEach(m => {
-                    const v = m.getAttribute("content");
-                    if (v) out.images.push(v);
-                  });
-                  document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
-                    try {
-                      const data = JSON.parse(s.textContent || "null");
-                      const arr = Array.isArray(data) ? data : [data];
-                      arr.forEach(obj => {
-                        const t = obj && obj["@type"];
-                        const isProduct = t === "Product" || (Array.isArray(t) && t.includes("Product"));
-                        if (isProduct && obj.image) {
-                          if (Array.isArray(obj.image)) out.images.push(...obj.image);
-                          else out.images.push(obj.image);
-                          const offers = Array.isArray(obj.offers) ? obj.offers[0] : obj.offers;
-                          const p = offers && (offers.price || (offers.priceSpecification && offers.priceSpecification.price));
-                          if (p && !out.price) out.price = String(p);
-                        }
-                      });
-                    } catch {}
-                  });
-                  document.querySelectorAll("picture source[srcset]").forEach(src => {
-                    const b = bestFromSrcset(src.getAttribute("srcset"));
-                    if (b) out.images.push(b);
-                  });
-                  document.querySelectorAll("img").forEach(img => {
-                    let c = img.getAttribute("data-enlarged") || img.getAttribute("data-zoom-image") || img.getAttribute("data-large_image") ||
-                            img.getAttribute("data-src") || img.getAttribute("src") || "";
-                    if (!c) {
-                      const ss = img.getAttribute("srcset") || img.getAttribute("data-srcset");
-                      if (ss) c = bestFromSrcset(ss);
-                    }
-                    if (c) out.images.push(c);
-                  });
-                  if (!out.price) {
-                    const m = (document.body.innerText || "").match(/\\$\\s?\\d{1,3}(?:,\\d{3})*(?:\\.\\d{2})?/);
-                    if (m) out.price = m[0];
-                  }
-                  const seen = new Set();
-                  out.images = out.images.filter(u => (u && !seen.has(u) && seen.add(u)));
-                  return out;
-                })();
-                """
-            }
-        ]
+        "timeout": 45000,
+        "device": "desktop",
+        "render": True
     }
+    if mode == "gentle":
+        payload["actions"] = [
+            {"type": "wait", "milliseconds": 800},
+            {"type": "scroll", "y": 1200},
+            {"type": "wait", "milliseconds": 1200},
+        ]
     try:
         r = requests.post(
             "https://api.firecrawl.dev/v2/scrape",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json=payload, timeout=90
+            json=payload, timeout=75
         )
         if r.status_code >= 400:
             return {}
@@ -566,40 +439,282 @@ def firecrawl_scrape_v2_aggressive(url: str, api_key: str) -> dict:
     except Exception:
         return {}
 
-def enrich_lumens_v2(url: str, api_key: str) -> Tuple[str, str, str]:
-    """
-    Lumens: canonicalize → Firecrawl simple → parse html → aggressive → local bs4 fallback.
-    Returns (image_url, price, status)
-    """
-    u = _canonicalize_lumens(url)
+def firecrawl_scrape_v2_aggressive(url: str, api_key: str) -> dict:
+    """Aggressive render with waits + mouseover + srcset evaluation."""
+    if not api_key:
+        return {}
+    payload = {
+        "url": url,
+        "formats": [
+            "html",
+            {"type": "json", "schema": {
+                "type": "object",
+                "properties": {"price": {"type": "string"}},
+                "required": []
+            }}
+        ],
+        "proxy": "auto",
+        "timeout": 70000,
+        "device": "desktop",
+        "render": True,
+        "actions": [
+            {"type": "wait", "milliseconds": 1200},
+            {"type": "scroll", "y": 800},
+            {"type": "wait", "milliseconds": 1200},
+            {"type": "scroll", "y": 1600},
+            {"type": "wait", "milliseconds": 1200},
+            {"type": "waitForSelector",
+             "selector": "[data-enlarged], [data-testid*='ImageCarousel'], [data-testid*='media'], [data-automation*='ProductImage'], picture source[srcset], img[srcset], img[data-src], img[data-srcset]",
+             "timeout": 12000},
+            {"type": "evaluate",
+             "script": """
+               (()=>{
+                 const sel = '[data-enlarged], [data-testid*="ImageCarousel"] img, [data-testid*="media"] img, [data-automation*="ProductImage"] img, img[data-src], img[srcset], img';
+                 const cand = document.querySelector(sel);
+                 if (cand) {
+                   cand.dispatchEvent(new MouseEvent('mouseover', {bubbles:true, cancelable:true, view:window}));
+                   cand.scrollIntoView({block:'center', inline:'center'});
+                 }
+               })();
+             """},
+            {"type": "wait", "milliseconds": 900},
+            {"type": "evaluate",
+             "script": """
+               (() => {
+                 function bestFromSrcset(ss) {
+                   if (!ss) return "";
+                   let best = ["", -1];
+                   ss.split(",").forEach(part => {
+                     const p = part.trim().split(/\\s+/);
+                     const url = p[0] || "";
+                     let w = -1;
+                     if (p[1] && /w$/.test(p[1])) {
+                       const n = parseInt(p[1].slice(0, -1), 10);
+                       if (!isNaN(n)) w = n;
+                     }
+                     if (w > best[1]) best = [url, w];
+                   });
+                   return best[0];
+                 }
+                 const out = { images: [], price: "" };
+                 document.querySelectorAll('meta[property="og:image"],meta[name="og:image"],meta[property="og:image:url"],meta[property="og:image:secure_url"],meta[name="twitter:image"]').forEach(m => {
+                   const v = m.getAttribute("content"); if (v) out.images.push(v);
+                 });
+                 document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
+                   try {
+                     const data = JSON.parse(s.textContent || "null");
+                     const arr = Array.isArray(data) ? data : [data];
+                     arr.forEach(obj => {
+                       const t = obj && obj["@type"];
+                       const isProduct = t === "Product" || (Array.isArray(t) && t.includes("Product"));
+                       if (isProduct && obj.image) {
+                         if (Array.isArray(obj.image)) out.images.push(...obj.image);
+                         else out.images.push(obj.image);
+                         if (!out.price && obj.offers) {
+                           const offers = Array.isArray(obj.offers) ? obj.offers[0] : obj.offers;
+                           const p = offers && (offers.price || (offers.priceSpecification && offers.priceSpecification.price));
+                           if (p) out.price = String(p);
+                         }
+                       }
+                     });
+                   } catch {}
+                 });
+                 const scope = document.querySelector('[data-testid*="ImageCarousel"], [class*="ImageCarousel"], [data-testid*="media"], [data-automation*="ProductImage"]') || document;
+                 scope.querySelectorAll("picture source[srcset], source[srcset]").forEach(src => {
+                   const best = bestFromSrcset(src.getAttribute("srcset"));
+                   if (best) out.images.push(best);
+                 });
+                 scope.querySelectorAll("img").forEach(img => {
+                   let cand = img.getAttribute("data-enlarged") || img.getAttribute("data-zoom-image") || img.getAttribute("data-large_image") ||
+                              img.getAttribute("data-src") || img.getAttribute("src") || "";
+                   if (!cand) {
+                     const ss = img.getAttribute("srcset") || img.getAttribute("data-srcset");
+                     if (ss) cand = bestFromSrcset(ss);
+                   }
+                   if (cand) out.images.push(cand);
+                 });
+                 if (!out.price) {
+                   const m = (document.body.innerText || "").match(/\\$\\s?\\d{1,3}(?:,\\d{3})*(?:\\.\\d{2})?/);
+                   if (m) out.price = m[0];
+                 }
+                 const seen = new Set();
+                 out.images = out.images.filter(u => (u && !seen.has(u) && seen.add(u)));
+                 return out;
+               })();
+             """}
+        ]
+    }
+    try:
+        r = requests.post(
+            "https://api.firecrawl.dev/v2/scrape",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload, timeout=95
+        )
+        if r.status_code >= 400:
+            return {}
+        return r.json()
+    except Exception:
+        return {}
 
-    sc1 = firecrawl_scrape_v2(u, api_key, mode="simple")
-    img1, price1, html1 = parse_image_and_price_from_v2(sc1)
-    if not img1:
-        img1 = _lumens_image_from_html(html1)
-    if img1 and price1:
-        return img1, price1, "lumens_fc_simple"
+def parse_image_and_price_from_v2_generic(sc: dict) -> Tuple[str, str, str]:
+    """Generic parse of Firecrawl result → (img, price, html)."""
+    if not sc: return "", "", ""
+    data = sc.get("data") or {}
+    meta = data.get("metadata") or {}
+    html = data.get("html") or ""
+    img = meta.get("og:image") or meta.get("og:image:url") or meta.get("twitter:image") or meta.get("image") or ""
+    price = ""
+    j = data.get("json")
+    if isinstance(j, dict):
+        content = j.get("content") if isinstance(j.get("content"), dict) else j
+        if isinstance(content, dict):
+            price = (content.get("price") or "").strip()
+    if html:
+        soup = BeautifulSoup(html or "", "lxml")
+        if not price:
+            for tag in soup.find_all("script", type="application/ld+json"):
+                try:
+                    obj = json.loads(tag.string or "")
+                except Exception:
+                    continue
+                arr = obj if isinstance(obj, list) else [obj]
+                for o in arr:
+                    t = o.get("@type")
+                    if t == "Product" or (isinstance(t, list) and "Product" in t):
+                        offers = o.get("offers") or {}
+                        if isinstance(offers, list): offers = offers[0] if offers else {}
+                        p = offers.get("price") or (offers.get("priceSpecification") or {}).get("price")
+                        if p:
+                            price = p if str(p).startswith("$") else f"${p}"
+                            break
+                if price: break
+        if not img:
+            m = soup.find("meta", attrs={"property":"og:image"}) or soup.find("meta", attrs={"name":"og:image"})
+            if m and m.get("content"): img = m["content"]
+        if not price:
+            m = PRICE_RE.search(soup.get_text(" ", strip=True))
+            if m: price = m.group(0)
+    return img or "", price or "", html or ""
 
-    sc2 = firecrawl_scrape_v2_aggressive(u, api_key)
-    img2, price2, html2 = parse_image_and_price_from_v2(sc2)
-    if not img2:
-        img2 = _lumens_image_from_html(html2)
-    if img2 or price2:
-        return img2, (price2 or price1), "lumens_fc_aggressive"
+# ===================== Enrichment orchestrators =====================
+def enrich_one_url_with_firecrawl(url: str, api_key: Optional[str]) -> Tuple[str, str, str]:
+    """Firecrawl simple→gentle→aggressive; then domain parse on HTML; then local bs4."""
+    u0 = canonicalize_url(url.strip())
+    u = add_cache_buster(u0) if api_key else u0
 
+    img = price = status = ""
+    html = ""
+
+    if api_key:
+        sc1 = firecrawl_scrape_v2(u, api_key, mode="simple")
+        i1, p1, h1 = parse_image_and_price_from_v2_generic(sc1)
+        img = img or i1; price = price or p1; html = html or h1; status = "fc_simple"
+
+        if not img or not price:
+            sc2 = firecrawl_scrape_v2(u, api_key, mode="gentle")
+            i2, p2, h2 = parse_image_and_price_from_v2_generic(sc2)
+            img = img or i2; price = price or p2; html = html or h2; status = "fc_gentle" if (i2 or p2) else status
+
+        if not img or not price:
+            sc3 = firecrawl_scrape_v2_aggressive(u, api_key)
+            i3, p3, h3 = parse_image_and_price_from_v2_generic(sc3)
+            img = img or i3; price = price or p3; html = html or h3; status = "fc_aggressive" if (i3 or p3) else (status or "fc_none")
+
+        # Run domain-specific pass on Firecrawl HTML (if we have it)
+        if html:
+            low = u0.lower()
+            if "lumens.com" in low:
+                i4, p4 = parse_image_and_price_lumens(html, u0)
+                if i4: img = i4
+                if p4: price = p4
+                status += "+lumens_html"
+            elif "wayfair.com" in low:
+                i4, p4 = parse_image_and_price_wayfair(html, u0)
+                if i4: img = i4
+                if p4: price = p4
+                status += "+wayfair_html"
+            elif "crateandbarrel.com" in low or "cb2.com" in low:
+                i4, p4 = parse_image_and_price_crate_cb2(html, u0)
+                if i4: img = i4
+                if p4: price = p4
+                status += "+cratecb2_html"
+
+    # Final fallback: direct fetch and parse
+    if not img or not price:
+        r = requests_get(u0)
+        if r and r.text:
+            low = u0.lower()
+            if "lumens.com" in low:
+                i5, p5 = parse_image_and_price_lumens(r.text, u0); status = (status + "+lumens_bs4") if status else "lumens_bs4"
+            elif "wayfair.com" in low:
+                i5, p5 = parse_image_and_price_wayfair(r.text, u0); status = (status + "+wayfair_bs4") if status else "wayfair_bs4"
+            elif "crateandbarrel.com" in low or "cb2.com" in low:
+                i5, p5 = parse_image_and_price_crate_cb2(r.text, u0); status = (status + "+cratecb2_bs4") if status else "cratecb2_bs4"
+            else:
+                i5, p5 = pick_image_and_price_bs4(r.text, u0); status = (status + "+generic_bs4") if status else "generic_bs4"
+            img = img or i5; price = price or p5
+        else:
+            status = (status + "+fetch_failed") if status else "fetch_failed"
+
+    return img or "", price or "", status or "unknown"
+
+def enrich_one_url_no_fc(url: str) -> Tuple[str, str, str]:
+    """Pure local fallback if no API key present."""
+    u = canonicalize_url(url.strip())
     r = requests_get(u)
-    if r and r.text:
-        img3 = _lumens_image_from_html(r.text)
-        if not img3:
-            i4, _ = pick_image_and_price_bs4(r.text, u)
-            img3 = i4
-        _, p4 = pick_image_and_price_bs4(r.text, u)
-        return img3, (p4 or price1), "lumens_bs4"
+    if not r or not r.text:
+        return "", "", "fetch_failed"
+    html = r.text; low = u.lower()
+    if "lumens.com" in low:
+        img, price = parse_image_and_price_lumens(html, u); return img, price, "lumens_bs4"
+    if "wayfair.com" in low:
+        img, price = parse_image_and_price_wayfair(html, u); return img, price, "wayfair_bs4"
+    if "crateandbarrel.com" in low or "cb2.com" in low:
+        img, price = parse_image_and_price_crate_cb2(html, u); return img, price, "cratecb2_bs4"
+    img, price = pick_image_and_price_bs4(html, u); return img, price, "generic_bs4"
 
-    return "", "", "lumens_fail"
+# ===================== Sidebar (API key) =====================
+with st.sidebar:
+    st.subheader("Firecrawl (optional)")
+    api_key_input = st.text_input(
+        "FIRECRAWL_API_KEY",
+        value=os.getenv("FIRECRAWL_API_KEY", ""),
+        type="password",
+        help="Paste your Firecrawl API key. Leave blank to use local-only fallback."
+    )
+    st.caption("Flow: Firecrawl render simple→gentle→aggressive, then domain parsers (Lumens/Wayfair/Crate/CB2).")
 
+# ===================== Tabs =====================
+tab1, tab2, tab3 = st.tabs([
+    "1) Extract from PDF",
+    "2) Enrich CSV (Image URL + Price)",
+    "3) Test single URL"
+])
 
-# ========================= Batch enrich =========================
+# ===================== Tab 1: PDF → Links =====================
+with tab1:
+    st.caption("Upload a PDF → extract all web links → download a CSV.")
+    uploaded_pdf = st.file_uploader("Upload a PDF", type="pdf", key="pdf_uploader")
+    if uploaded_pdf:
+        st.info(f"File uploaded: {uploaded_pdf.name}")
+        if st.button("Extract Links", key="extract_btn"):
+            with st.spinner("Extracting links..."):
+                pdf_bytes = uploaded_pdf.read()
+                result_df = extract_links_from_pdf(pdf_bytes)
+            if result_df.empty:
+                st.warning("No links found in this PDF.")
+            else:
+                st.success("Done! ✅")
+                st.dataframe(result_df, use_container_width=True)
+                csv_bytes = result_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download results CSV",
+                    data=csv_bytes,
+                    file_name=f"{uploaded_pdf.name}_links.csv",
+                    mime="text/csv",
+                )
+
+# ===================== Tab 2: Enrich CSV =====================
 def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str]) -> pd.DataFrame:
     out = df.copy()
     if url_col not in out.columns:
@@ -614,131 +729,56 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str]) -> pd.Da
     prices = out.get("price",               pd.Series([""]*len(out))).astype(str).tolist()
     status = out.get("scrape_status",       pd.Series([""]*len(out))).astype(str).tolist()
 
-    prog = st.progress(0); box = st.empty()
-    t0 = time.perf_counter(); times = []
+    prog = st.progress(0)
+    status_box = st.empty()
+    t_start = time.perf_counter()
+    per_link_times = []
     key = (api_key or "").strip()
 
-    for i, u in enumerate(urls, start=1):
+    for k, u in enumerate(urls, start=1):
         u = u.strip()
         img = price = ""; st_code = ""
-        with Timer() as tt:
-            if key and u:
-                low = u.lower()
-                if "lumens.com" in low:
-                    img, price, st_code = enrich_lumens_v2(u, key)
-                else:
-                    img, price, st_code = enrich_domain_firecrawl_v2(u, key)
-            if (not img or not price) and u:
+        with Timer() as t:
+            if key:
+                img, price, st_code = enrich_one_url_with_firecrawl(u, key)
+            else:
+                img, price, st_code = enrich_one_url_no_fc(u)
+
+            if not img or not price:
+                # one more tiny try: direct generic bs4
                 r = requests_get(u)
                 if r and r.text:
                     i2, p2 = pick_image_and_price_bs4(r.text, u)
-                    img = img or i2; price = price or p2
+                    img = img or i2
+                    price = price or p2
                     st_code = (st_code + "+bs4_ok") if st_code else "bs4_ok"
                 else:
                     st_code = (st_code + "+fetch_failed") if st_code else "fetch_failed"
-        imgs[i-1] = img; prices[i-1] = price; status[i-1] = st_code
-        times.append(tt.dt)
-        avg = sum(times)/len(times)
-        eta = int((len(urls)-i)*avg)
-        box.write(f"Processed {i}/{len(urls)} • last {tt.dt:.2f}s • avg {avg:.2f}s/link • ETA ~{eta}s")
-        prog.progress(i/len(urls))
-        time.sleep(0.1)
+
+        imgs[k-1] = img; prices[k-1] = price; status[k-1] = st_code
+
+        per_link_times.append(t.dt)
+        avg = sum(per_link_times) / max(len(per_link_times), 1)
+        remaining = (len(urls) - k) * avg
+        status_box.write(
+            f"Processed {k}/{len(urls)} • last {t.dt:.2f}s • avg {avg:.2f}s/link • ETA ~{int(remaining)}s"
+        )
+        prog.progress(k/len(urls))
+        time.sleep(0.25 + 0.35*random.random())  # polite jitter
+
+    total = time.perf_counter() - t_start
+    if urls:
+        status_box.write(f"Done {len(urls)} link(s) in {total:.1f}s • avg {(total/len(urls)):.2f}s/link")
+    else:
+        status_box.write("Nothing to do — no URLs found.")
 
     out["scraped_image_url"] = imgs
     out["price"] = prices
     out["scrape_status"] = status
     return out
 
-
-# ========================= UI =========================
-with st.sidebar:
-    st.subheader("Firecrawl (optional)")
-    api_key_input = st.text_input(
-        "FIRECRAWL_API_KEY",
-        value=os.getenv("FIRECRAWL_API_KEY", ""),
-        type="password"
-    )
-    st.caption("Leave blank to use the built-in parser only (no credits used).")
-
-tab1, tab2, tab3 = st.tabs([
-    "1) Extract from PDF (pages + Tags + Position + full titles)",
-    "2) Enrich CSV (Image URL + Price)",
-    "3) Test single URL",
-])
-
-# --- Tab 1: PDF → rows ---
-with tab1:
-    st.caption("Make a page→Tags table, then extract ALL web links on those pages. Each link stays on its own row.")
-    pdf_file = st.file_uploader("Upload PDF", type="pdf", key="pdf_extractor")
-    num_pages = None
-    if pdf_file:
-        try:
-            _peek = fitz.open("pdf", pdf_file.getvalue())
-            num_pages = len(_peek)
-            st.info(f"PDF detected with **{num_pages}** page(s).")
-        except Exception as e:
-            st.error(f"Could not read PDF: {e}")
-
-    st.markdown("**Page → Tags table**")
-    default_df = pd.DataFrame([{"page": "", "Tags": ""}])
-    mapping_df = st.data_editor(
-        default_df, num_rows="dynamic", use_container_width=True, key="page_tag_editor",
-        column_config={
-            "page": st.column_config.TextColumn("page", help="Page number (1-based)"),
-            "Tags": st.column_config.TextColumn("Tags", help="Room name for that page"),
-        }
-    )
-
-    only_listed = st.checkbox("Only extract pages listed above", value=True)
-    pad_px = st.slider("Link capture pad (pixels)", 0, 10, 2, 1)
-    band_px = st.slider("Nearby band height (pixels)", 0, 40, 18, 1)
-    require_num = st.checkbox("Require leading number (1., 2., …) to keep a row", value=False)
-
-    run1 = st.button("Extract", type="primary", disabled=(pdf_file is None), key="extract_btn")
-
-    if run1 and pdf_file:
-        page_to_tag = {}
-        if num_pages is None:
-            try:
-                num_pages = len(fitz.open("pdf", pdf_file.getvalue()))
-            except:
-                num_pages = None
-        for _, row in mapping_df.iterrows():
-            p_raw = str(row.get("page","")).strip()
-            t_raw = str(row.get("Tags","")).strip()
-            if not p_raw: continue
-            try:
-                p_no = int(p_raw)
-                if p_no >= 1 and (num_pages is None or p_no <= num_pages):
-                    page_to_tag[p_no] = t_raw
-            except:
-                continue
-
-        pdf_bytes = pdf_file.read()
-        with st.spinner("Extracting links, positions & titles…"):
-            df = extract_links_by_pages(
-                pdf_bytes,
-                page_to_tag,
-                only_listed_pages=only_listed,
-                pad_px=pad_px,
-                band_px=band_px,
-                require_leading_number=require_num,
-            )
-        if df.empty:
-            st.info("No links found. Verify the PDF uses live hyperlinks (not just images).")
-        else:
-            st.success(f"Extracted {len(df)} row(s).")
-            st.dataframe(df, use_container_width=True)
-            st.download_button(
-                "Download CSV",
-                df.to_csv(index=False).encode("utf-8"),
-                file_name="canva_links_with_position.csv",
-                mime="text/csv"
-            )
-
-# --- Tab 2: Enrich CSV ---
 with tab2:
-    st.caption("Upload a CSV containing product URLs (column name 'Product URL' or choose one).")
+    st.caption("Provide a CSV with a 'Product URL' column (or choose another).")
     csv_file = st.file_uploader("Upload links CSV", type=["csv"], key="csv_uploader")
     if csv_file is not None:
         try:
@@ -752,7 +792,7 @@ with tab2:
             url_col_guess = "Product URL" if "Product URL" in df_in.columns else df_in.columns[min(1, len(df_in)-1)]
             url_col = st.text_input("URL column name", url_col_guess)
             if st.button("Enrich (Image URL + Price)", key="enrich_btn"):
-                with st.spinner("Scraping image + price..."):
+                with st.spinner("Scraping image + price…"):
                     df_out = enrich_urls(df_in, url_col, api_key_input)
                 st.success("Enriched! ✅")
                 st.dataframe(df_out, use_container_width=True)
@@ -767,27 +807,18 @@ with tab2:
     else:
         st.info("Upload a CSV to enrich. Tip: you can feed the CSV from Tab 1 after you add product URLs.")
 
-# --- Tab 3: Test a single URL ---
+# ===================== Tab 3: Test a single URL =====================
 with tab3:
-    st.caption("Test a single product URL (Firecrawl v2 first, then local parser fallback).")
-    test_url = st.text_input("Product URL to test", "https://www.lumens.com/xavier-wall-sconce-by-crystorama-CRYP535322.html?cgid=20")
+    st.caption("Paste a single product URL and test the enrichment (Firecrawl → domain parsers → fallback).")
+    test_url = st.text_input(
+        "Product URL to test",
+        "https://www.lumens.com/xavier-wall-sconce-by-crystorama-CRYP535322.html"
+    )
     if st.button("Run test", key="single_test_btn"):
-        img = price = ""; status = ""
-        if api_key_input:
-            low = test_url.lower()
-            if "lumens.com" in low:
-                img, price, status = enrich_lumens_v2(test_url, api_key_input)
-            else:
-                img, price, status = enrich_domain_firecrawl_v2(test_url, api_key_input)
-
-        if not img or not price:
-            r = requests_get(test_url)
-            if r and r.text:
-                i2, p2 = pick_image_and_price_bs4(r.text, test_url)
-                img = img or i2; price = price or p2
-                status = (status + "+bs4_ok") if status else "bs4_ok"
-            else:
-                status = (status + "+fetch_failed") if status else "fetch_failed"
+        if api_key_input.strip():
+            img, price, status = enrich_one_url_with_firecrawl(test_url, api_key_input.strip())
+        else:
+            img, price, status = enrich_one_url_no_fc(test_url)
 
         st.write("**Status:**", status or "unknown")
         st.write("**Image URL:**", img or "—")
