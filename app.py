@@ -1,8 +1,3 @@
-# app.py — Combined:
-# Tab 1: Canva PDF extractor (page→Tags + strict per-link title + Position + Type/QTY/Finish/Size)
-# Tab 2: Enrich CSV (Firecrawl v2 + generic/ Lumens helpers) — from your working version
-# Tab 3: Test single URL — from your working version
-
 import os, io, re, json, time, requests
 from typing import Optional, Tuple
 import streamlit as st
@@ -125,7 +120,7 @@ def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 
     words = page.get_text("words") or []  # [x0,y0,x1,y1,word,block,line,word_no]
     kept = []
     for x0, y0, x1, y1, w, *_ in words:
-        if not w: 
+        if not w:
             continue
         cx = (x0 + x1) / 2.0
         cy = (y0 + y1) / 2.0
@@ -136,7 +131,7 @@ def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 
         # band fallback: same Y ± band, with X overlap
         band = fitz.Rect(r.x0, r.y0 - band_px, r.x1, r.y1 + band_px)
         for x0, y0, x1, y1, w, *_ in words:
-            if not w: 
+            if not w:
                 continue
             cy_in = band.y0 <= ((y0 + y1) / 2.0) <= band.y1
             x_overlaps = not (x1 < r.x0 or x0 > r.x1)
@@ -170,6 +165,50 @@ def split_position_and_title_start(raw: str) -> tuple[str, str]:
         rest = rest[:m2.start()].strip()
     return pos, rest
 
+# ----------------- Room mapping logic -----------------
+ROOM_MAP_RAW = [
+    ("Sink", "Plumbing"),
+    ("Faucet", "Plumbing"),
+    ("Sink Faucet", "Plumbing"),
+    ("Shower", "Plumbing"),
+    ("Shower Head", "Plumbing"),
+    ("Tub", "Plumbing"),
+    ("Shower System", "Plumbing"),
+    ("Shower Drain", "Plumbing"),
+    ("Pendant", "Lighting"),
+    ("Sconce", "Lighting"),
+    ("Sconces", "Lighting"),
+    ("Lamp", "Lighting"),
+]
+
+# build a lowercase lookup dict for exact/starts-with style checks
+ROOM_MAP = {k.lower(): v for (k, v) in ROOM_MAP_RAW}
+
+def _infer_room_from_tag(tag_val: str) -> str:
+    """
+    Given a 'Tags' value from the page (ex: "Sink" / "Pendant" / etc.),
+    return the mapped Room ("Plumbing", "Lighting", ...).
+
+    Strategy:
+    1. exact lowercase match
+    2. startswith match (so "Sink Faucet" still hits "Sink Faucet" first, then "Sink")
+    Fallback: "" (blank)
+    """
+    if not tag_val:
+        return ""
+    t = tag_val.strip().lower()
+
+    # exact
+    if t in ROOM_MAP:
+        return ROOM_MAP[t]
+
+    # try longest key that is prefix of t
+    best_key = ""
+    for k in ROOM_MAP.keys():
+        if t.startswith(k) and len(k) > len(best_key):
+            best_key = k
+    return ROOM_MAP.get(best_key, "")
+
 def extract_links_by_pages(
     pdf_bytes: bytes,
     page_to_tag: dict[int, str] | None,
@@ -196,9 +235,10 @@ def extract_links_by_pages(
             position, title = split_position_and_title_start(raw)
             fields = parse_link_title_fields(title)
 
-            rows.append({
+                        rows.append({
                 "page": pidx,
                 "Tags": tag_value,
+                "Room": _infer_room_from_tag(tag_value),
                 "Position": position,
                 "Type": fields.get("Type",""),
                 "QTY": fields.get("QTY",""),
@@ -206,6 +246,7 @@ def extract_links_by_pages(
                 "Size": fields.get("Size",""),
                 "link_url": uri,
                 "link_text": title,
+            }
             })
     return pd.DataFrame(rows)
 
@@ -277,7 +318,7 @@ def _largest_from_srcset(srcset_value: str) -> str:
     best_url, best_w = "", -1
     for part in (srcset_value or "").split(","):
         s = part.strip()
-        if not s: 
+        if not s:
             continue
         pieces = s.split()
         url = pieces[0]
@@ -320,194 +361,57 @@ def _first_lumens_pdp_large_from_html(html: str) -> str:
 
     return ""
 
-def _extract_desired_finish(url: str) -> str:
-    """
-    Pull something like dwvar_<sku>_AttrValue1=<Finish Name> from the query string.
-    We'll URL-decode + normalize whitespace for matching.
-    Example:
-    ...&dwvar_CRYP535322_AttrValue1=Vibrant%20Gold%20with%20White
-    -> "Vibrant Gold with White"
-    """
-    try:
-        p = urlparse(url)
-        qs = dict(parse_qsl(p.query, keep_blank_values=True))
-    except Exception:
-        return ""
-    for k, v in qs.items():
-        # Lumens tends to name these dwvar_SKU_AttrValue1=FinishName
-        if k.lower().startswith("dwvar_") and "attrvalue" in k.lower() and v.strip():
-            return re.sub(r"\s+", " ", v.strip())
-    return ""
-
-
-def _pick_image_for_finish(html: str, md: str, desired_finish: str) -> str:
-    """
-    Try to prefer an image URL that matches the selected finish (like 'Vibrant Gold with White').
-
-    Strategy:
-    1. Look in markdown near the finish text for a PDP-large image URL.
-    2. Look in raw HTML near the finish text for a PDP-large image URL.
-    3. Walk the DOM: find any element containing that finish text, then look
-       under that element (and its parents) for <img>/<source> tags whose src
-       or srcset includes the Lumens PDP-large pattern.
-    """
-    if not desired_finish:
-        return ""
-
-    finish_norm = desired_finish.lower()
-
-    def _scan_blob(blob: str) -> str:
-        if not blob:
-            return ""
-        # Find every match of the finish name in the blob, then look ~500 chars around it
-        for m in re.finditer(re.escape(finish_norm), blob.lower()):
-            start = max(m.start() - 500, 0)
-            end = m.end() + 500
-            window = blob[start:end]
-            # Look for any Lumens PDP-large URL near that finish text
-            m_img = LUMENS_PDP_RE.search(window)
-            if m_img:
-                return m_img.group(0)
-        return ""
-
-    # pass 1: markdown
-    cand = _scan_blob(md or "")
-    if cand:
-        return cand
-
-    # pass 2: html
-    cand = _scan_blob(html or "")
-    if cand:
-        return cand
-
-    # pass 3: DOM walk around the finish text
-    try:
-        soup = BeautifulSoup(html or "", "lxml")
-    except Exception:
-        soup = None
-
-    if soup is not None:
-        # find any node whose text mentions the finish
-        finish_nodes = [
-            node for node in soup.find_all(string=True)
-            if isinstance(node, str) and finish_norm in node.strip().lower()
-        ]
-
-        for node in finish_nodes:
-            parent = node.parent
-            # walk up to 2 levels up to catch the variant block wrapper
-            ancestors = [
-                parent,
-                getattr(parent, "parent", None),
-                getattr(getattr(parent, "parent", None), "parent", None),
-            ]
-            for anc in ancestors:
-                if not anc:
-                    continue
-                # search images/sources under this ancestor
-                for im in anc.find_all(["img", "source"]):
-                    for attr in (
-                        "data-src",
-                        "data-original",
-                        "data-zoom-image",
-                        "data-large_image",
-                        "src",
-                        "srcset",
-                        "data-srcset",
-                    ):
-                        v = im.get(attr)
-                        if not isinstance(v, str):
-                            continue
-                        if "Lumens.com-PDP-large" in v:
-                            # if it's a srcset we want the largest candidate
-                            if attr.endswith("srcset"):
-                                biggest = _largest_from_srcset(v)
-                                if biggest:
-                                    return biggest
-                            else:
-                                return v
-
-    return ""
-
-
-def parse_image_and_price_lumens_from_v2(
-    scrape: dict,
-    desired_finish: str = ""
-) -> Tuple[str, str]:
-    """
-    Lumens: prefer the hero image that matches the requested finish (variant),
-    then fall back to generic PDP-large extraction. Also extract price.
-    """
+def parse_image_and_price_lumens_from_v2(scrape: dict) -> Tuple[str, str]:
+    """Lumens: prefer PDP-large in markdown/html, then meta/JSON-LD/visible."""
     if not scrape:
         return "", ""
-
     data = scrape.get("data") or {}
     html = data.get("html") or ""
-    md = data.get("markdown") or ""
+    md   = data.get("markdown") or ""
 
-    # 1. Try to get an image specifically tied to the selected finish
-    img = _pick_image_for_finish(html, md, desired_finish)
-
-    # 2. If we still don't have an image, fall back to old behavior
+    img = ""
+    if isinstance(md, str):
+        m = LUMENS_PDP_RE.search(md)
+        if m:
+            img = m.group(0)
     if not img:
-        if isinstance(md, str):
-            m = LUMENS_PDP_RE.search(md)
-            if m:
-                img = m.group(0)
-        if not img:
-            img = _first_lumens_pdp_large_from_html(html)
+        img = _first_lumens_pdp_large_from_html(html)
 
-    # 3. Price extraction (mostly same as before)
     price = ""
     j = data.get("json")
     if isinstance(j, dict):
         content = j.get("content") if isinstance(j.get("content"), dict) else j
         if isinstance(content, dict):
-            raw_price = content.get("price") or ""
-            price = (raw_price or "").strip()
+            price = (content.get("price") or "").strip()
 
     if not price and html:
         soup = BeautifulSoup(html or "", "lxml")
-
-        # Look in JSON-LD
         for tag in soup.find_all("script", type="application/ld+json"):
             try:
                 obj = json.loads(tag.string or "")
             except Exception:
                 continue
-
             objs = obj if isinstance(obj, list) else [obj]
             for o in objs:
                 t = o.get("@type")
                 if t == "Product" or (isinstance(t, list) and "Product" in t):
                     offers = o.get("offers") or {}
-                    if isinstance(offers, list):
-                        offers = offers[0] if offers else {}
-                    p = (
-                        offers.get("price")
-                        or (offers.get("priceSpecification") or {}).get("price")
-                    )
+                    if isinstance(offers, list): offers = offers[0] if offers else {}
+                    p = offers.get("price") or (offers.get("priceSpecification") or {}).get("price")
                     if p:
                         price = p if str(p).startswith("$") else f"${p}"
                         break
-            if price:
-                break
-
-        # Fallback: meta tags
+            if price: break
         if not price:
-            m = soup.find("meta", attrs={"itemprop": "price"}) or soup.find(
-                "meta",
-                attrs={"property": "product:price:amount"}
-            )
+            m = soup.find("meta", attrs={"itemprop": "price"}) or \
+                soup.find("meta", attrs={"property": "product:price:amount"})
             if m and m.get("content"):
                 val = m["content"]
                 price = val if str(val).startswith("$") else f"${val}"
-
-        # Last-ditch: regex any $###.## from visible text
         if not price:
-            m = PRICE_RE.search(soup.get_text(" ", strip=True))
-            if m:
-                price = m.group(0)
+            t = soup.get_text(" ", strip=True)
+            m = PRICE_RE.search(t)
+            if m: price = m.group(0)
 
     return img or "", price or ""
 
@@ -606,26 +510,16 @@ def enrich_ferguson_v2(url: str, api_key: str) -> Tuple[str, str, str]:
 
 def enrich_lumens_v2(url: str, api_key: str) -> Tuple[str, str, str]:
     u = canonicalize_url(url)
-
-    # pull "Vibrant Gold with White" (or whatever) from the dwvar_... param
-    desired_finish = _extract_desired_finish(u)
-
-    # Try fast scrape first
     sc = firecrawl_scrape_v2(u, api_key, mode="simple")
-    img, price = parse_image_and_price_lumens_from_v2(sc, desired_finish)
+    img, price = parse_image_and_price_lumens_from_v2(sc)
     status = "firecrawl_v2_simple"
-
-    # If we didn't get either image or price, try a slower scrape with scroll+wait
     if not img or not price:
         sc2 = firecrawl_scrape_v2(u, api_key, mode="gentle")
-        i2, p2 = parse_image_and_price_lumens_from_v2(sc2, desired_finish)
+        i2, p2 = parse_image_and_price_lumens_from_v2(sc2)
         img = img or i2
         price = price or p2
         status = "firecrawl_v2_gentle" if (i2 or p2) else status
-
     return img, price, status
-
-
 
 # ----------------- Sidebar (API key) -----------------
 with st.sidebar:
@@ -855,4 +749,3 @@ with tab3:
         st.write("**Price:**", price or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
-
