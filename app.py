@@ -216,12 +216,6 @@ def extract_links_by_pages(
     pad_px: float = 4.0,
     band_px: float = 28.0,
 ) -> pd.DataFrame:
-    pdf_bytes: bytes,
-    page_to_tag: dict[int, str] | None,
-    only_listed_pages: bool = True,
-    pad_px: float = 4.0,
-    band_px: float = 28.0,
-) -> pd.DataFrame:
     doc = fitz.open("pdf", pdf_bytes)
     rows = []
     listed = set(page_to_tag.keys()) if page_to_tag else set()
@@ -239,7 +233,7 @@ def extract_links_by_pages(
             rect = lnk.get("from")
             raw = extract_link_title_strict(page, rect, pad_px=pad_px, band_px=band_px)
             position, title = split_position_and_title_start(raw)
-                        fields = parse_link_title_fields(title)
+            fields = parse_link_title_fields(title)
 
             rows.append({
                 "page": pidx,
