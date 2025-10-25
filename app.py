@@ -48,103 +48,112 @@ def canonicalize_url(u: str) -> str:
         return u
 
 # ========================= TAB 1: Canva PDF extractor =========================
-import re
-QTY_RE     = re.compile(r"^(?:QTY|Qty|qty|Quantity)\s*:\s*([0-9Xx]+)\s*$")
-FINISH_RE  = re.compile(r"^(?:FINISH|Finish)\s*:\s*(.+)$")
-SIZE_RE    = re.compile(r"^(?:SIZE|Size|Dimensions?)\s*:\s*(.+)$")
-TYPE_RE    = re.compile(r"^(?:TYPE|Type)\s*:\s*(.+)$")
+# Robust parsers (case-insensitive, tolerate ":" or "-", smart quotes, etc.)
+QTY_RE     = re.compile(r"(?i)\b(?:QTY|Quantity)\b\s*[:\-]?\s*([0-9X]+)\b")
+FINISH_RE  = re.compile(r"(?i)\bFinish\b\s*[:\-]?\s*(.+)")
+SIZE_RE    = re.compile(r"(?i)\b(?:Size|Dimensions?)\b\s*[:\-]?\s*(.+)")
+TYPE_RE    = re.compile(r"(?i)\bType\b\s*[:\-]?\s*(.+)")
+
+# bullets/positions: “1.”, “1 ”, middle dot, small dot
+POS_AT_START = re.compile(r'^\s*(\d{1,3})[.\u2024\u00B7]?\s*')
+NEXT_BULLET  = re.compile(r'\s(\d{1,3})[.\u2024\u00B7](?=\s|[A-Z])')
+
+def _normalize_separators(s: str) -> str:
+    if not s: return ""
+    # unroll newlines into pipes, keep existing pipes/semicolons spaced
+    s = s.replace("\n", " | ")
+    s = re.sub(r"\s*\|\s*", " | ", s)
+    s = re.sub(r"\s*;\s*", "; ", s)
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip()
 
 def parse_link_title_fields(link_text: str) -> dict:
     fields = {"Type": "", "QTY": "", "Finish": "", "Size": ""}
-    s = (link_text or "").replace("\n", " | ").strip()
+    s = _normalize_separators(link_text)
     if not s:
         return fields
 
+    # Split on pipes primarily; allow semicolons inside each chunk
     parts = []
     for chunk in s.split("|"):
         subs = [x.strip() for x in chunk.split(";")]
         parts.extend([x for x in subs if x])
 
     for tok in parts:
-        m = TYPE_RE.match(tok)
+        m = TYPE_RE.search(tok)
         if m and not fields["Type"]:
             fields["Type"] = m.group(1).strip(); continue
-        m = QTY_RE.match(tok)
+        m = QTY_RE.search(tok)
         if m and not fields["QTY"]:
-            q = m.group(1).strip()
-            fields["QTY"] = "" if q.upper() == "XX" else q
+            q = m.group(1).strip().upper()
+            fields["QTY"] = "" if q == "XX" else q
             continue
-        m = FINISH_RE.match(tok)
+        m = FINISH_RE.search(tok)
         if m and not fields["Finish"]:
             fields["Finish"] = m.group(1).strip(); continue
-        m = SIZE_RE.match(tok)
+        m = SIZE_RE.search(tok)
         if m and not fields["Size"]:
-            fields["Size"] = m.group(1).strip(); continue
+            size_val = m.group(1).strip()
+            size_val = size_val.replace("”", '"').replace("“", '"').replace("’", "'").replace("‘", "'")
+            size_val = re.sub(r"\s*[xX]\s*", " x ", size_val)
+            fields["Size"] = size_val.strip(); continue
 
+    # If Type was unlabeled (e.g., "PENDANTS | QTY: 2 | ..."), infer from first unlabeled token
     if not fields["Type"]:
         for tok in parts:
-            if ":" in tok: 
+            if ":" in tok or "-" in tok:  # likely a labeled field
                 continue
             if tok.strip():
                 fields["Type"] = tok.strip()
                 break
 
-    if fields["Size"]:
-        fields["Size"] = re.sub(r"\s*[xX]\s*", " x ", fields["Size"]).strip()
-
     return fields
 
-def extract_link_title_strict(page, rect, pad_px: float = 2.0, band_px: float = 18.0) -> str:
-    """Take only text that truly belongs to this link (no merging)."""
+def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 28.0) -> str:
+    """
+    STRICT per-link capture based on per-word boxes:
+      1) Take words whose center lies inside the (slightly padded) link rect.
+      2) If empty, look in a thin horizontal band that overlaps X with the rect.
+      3) As a last resort, fall back to page.get_textbox(rect).
+    """
     import fitz
-    def norm(s: str) -> str:
-        s = re.sub(r"\s*\|\s*", " | ", s)
-        s = re.sub(r"\s*;\s*", "; ", s)
-        s = re.sub(r"\s{2,}", " ", s)
-        return s.strip()
-
     if not rect:
         return ""
     r = fitz.Rect(rect).normalize()
     R = fitz.Rect(r.x0 - pad_px, r.y0 - pad_px, r.x1 + pad_px, r.y1 + pad_px)
 
-    raw = page.get_text("rawdict") or {}
-    words = []
-    for blk in raw.get("blocks", []):
-        if blk.get("type") != 0:
+    words = page.get_text("words") or []  # [x0,y0,x1,y1,word,block,line,word_no]
+    kept = []
+    for x0, y0, x1, y1, w, *_ in words:
+        if not w: 
             continue
-        for line in blk.get("lines", []):
-            for span in line.get("spans", []):
-                tx = span.get("text", "")
-                bbox = span.get("bbox")
-                if not tx or not bbox:
-                    continue
-                x0, y0, x1, y1 = bbox
-                cx = (x0 + x1) / 2.0
-                cy = (y0 + y1) / 2.0
-                words.append((cx, cy, x0, y0, x1, y1, tx))
-
-    kept = [(y0, x0, tx) for cx, cy, x0, y0, x1, y1, tx in words
-            if R.contains(fitz.Point(cx, cy)) and tx]
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        if R.contains(fitz.Point(cx, cy)):
+            kept.append((y0, x0, w))
 
     if not kept:
+        # band fallback: same Y ± band, with X overlap
         band = fitz.Rect(r.x0, r.y0 - band_px, r.x1, r.y1 + band_px)
-        kept = []
-        for cx, cy, x0, y0, x1, y1, tx in words:
-            if not tx:
+        for x0, y0, x1, y1, w, *_ in words:
+            if not w: 
                 continue
-            cy_in = (band.y0 <= cy <= band.y1)
+            cy_in = band.y0 <= ((y0 + y1) / 2.0) <= band.y1
             x_overlaps = not (x1 < r.x0 or x0 > r.x1)
             if cy_in and x_overlaps:
-                kept.append((y0, x0, tx))
+                kept.append((y0, x0, w))
 
-    if not kept:
-        return ""
     kept.sort(key=lambda t: (round(t[0], 3), t[1]))
-    return norm(" ".join(t[2] for t in kept))
+    text = " ".join(t[2] for t in kept).strip()
 
-POS_AT_START = re.compile(r'^\s*(\d{1,3})[.\u2024\u00B7]?\s*')
-NEXT_BULLET  = re.compile(r'\s(\d{1,3})[.\u2024\u00B7](?=\s|[A-Z])')
+    if not text:
+        # last resort: whatever the textbox returns
+        try:
+            text = (page.get_textbox(r) or "").strip()
+        except Exception:
+            text = ""
+
+    return _normalize_separators(text)
 
 def split_position_and_title_start(raw: str) -> tuple[str, str]:
     s = (raw or "").strip()
@@ -155,6 +164,7 @@ def split_position_and_title_start(raw: str) -> tuple[str, str]:
         return "", s
     pos = m.group(1)
     rest = s[m.end():].strip()
+    # If we accidentally captured the next bullet too, cut it off
     m2 = NEXT_BULLET.search(rest)
     if m2:
         rest = rest[:m2.start()].strip()
@@ -164,10 +174,9 @@ def extract_links_by_pages(
     pdf_bytes: bytes,
     page_to_tag: dict[int, str] | None,
     only_listed_pages: bool = True,
-    pad_px: float = 2.0,
-    band_px: float = 18.0,
+    pad_px: float = 4.0,
+    band_px: float = 28.0,
 ) -> pd.DataFrame:
-    """STRICT extractor used by Tab 1."""
     doc = fitz.open("pdf", pdf_bytes)
     rows = []
     listed = set(page_to_tag.keys()) if page_to_tag else set()
@@ -199,7 +208,6 @@ def extract_links_by_pages(
                 "link_text": title,
             })
     return pd.DataFrame(rows)
-
 
 # ========================= Tabs 2/3: Your Firecrawl + parsers =========================
 def pick_image_and_price_bs4(html: str, base_url: str) -> Tuple[str, str]:
@@ -513,8 +521,8 @@ with tab1:
         }
     )
     only_listed = st.checkbox("Only extract pages listed above", value=True)
-    pad_px = st.slider("Link capture pad (pixels)", 0, 10, 2, 1)
-    band_px = st.slider("Nearby text band (pixels)", 0, 40, 18, 2)
+    pad_px = st.slider("Link capture pad (pixels)", 0, 16, 4, 1)
+    band_px = st.slider("Nearby text band (pixels)", 0, 60, 28, 2)
 
     run1 = st.button("Extract", type="primary", disabled=(pdf_file is None), key="extract_btn")
     if run1 and pdf_file:
@@ -700,4 +708,3 @@ with tab3:
         st.write("**Price:**", price or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
-
