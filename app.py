@@ -1,5 +1,9 @@
-# app.py
-import os, io, json, re, requests, time
+# app.py — Combined:
+# Tab 1: Canva PDF extractor (page→Tags + strict per-link title + Position + Type/QTY/Finish/Size)
+# Tab 2: Enrich CSV (Firecrawl v2 + generic/ Lumens helpers) — from your working version
+# Tab 3: Test single URL — from your working version
+
+import os, io, re, json, time, requests
 from typing import Optional, Tuple
 import streamlit as st
 import fitz  # PyMuPDF
@@ -19,34 +23,7 @@ class Timer:
     def __exit__(self, *exc):
         self.dt = time.perf_counter() - self.t0
 
-# ----------------- PDF → Links extractor -----------------
-def extract_links_from_pdf(pdf_bytes: bytes) -> pd.DataFrame:
-    """Extract links + metadata from uploaded PDF file (bytes)."""
-    doc = fitz.open("pdf", pdf_bytes)
-    rows = []
-    for page in doc:
-        title_full = page.get_textbox(
-            fitz.Rect(page.rect.width * 0.5, 0,
-                      page.rect.width, page.rect.height * 0.1)
-        ).strip()
-        parts = title_full.split(' ', 1)
-        project = parts[0] if parts else ''
-        sheet = parts[1] if len(parts) > 1 else ''
-        for lnk in page.get_links():
-            uri = lnk.get('uri') or ''
-            if not uri.startswith(('http://', 'https://')):
-                continue
-            rect = fitz.Rect(lnk['from'])
-            link_title = page.get_textbox(rect).strip() or ''
-            rows.append({
-                'Product Name': link_title,
-                'Product URL': uri,
-                'project': project,
-                'sheet': sheet
-            })
-    return pd.DataFrame(rows)
-
-# ----------------- Common helpers -----------------
+# ========================= Shared HTTP/parsing helpers =========================
 PRICE_RE = re.compile(r"\$\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?")
 UA = {"User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
 
@@ -61,10 +38,184 @@ def requests_get(url: str, timeout: int = 20, retries: int = 2) -> Optional[requ
         time.sleep(0.25)
     return None
 
+def canonicalize_url(u: str) -> str:
+    try:
+        p = urlparse(u)
+        q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+             if not k.lower().startswith(("utm_", "gclid", "gbraid", "wbraid", "msclkid", "mc_"))]
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q), ""))
+    except Exception:
+        return u
+
+# ========================= TAB 1: Canva PDF extractor =========================
+# Parse fields from FULL link title text
+QTY_RE     = re.compile(r"^(?:QTY|Qty|qty|Quantity)\s*:\s*([0-9Xx]+)\s*$")
+FINISH_RE  = re.compile(r"^(?:FINISH|Finish)\s*:\s*(.+)$")
+SIZE_RE    = re.compile(r"^(?:SIZE|Size|Dimensions?)\s*:\s*(.+)$")
+TYPE_RE    = re.compile(r"^(?:TYPE|Type)\s*:\s*(.+)$")
+
+def parse_link_title_fields(link_text: str) -> dict:
+    """
+    Parse 'PENDANT | QTY: 1 | FINISH: Brass, White | SIZE: 48"' style strings.
+    Accepts pipes or semicolons. If Type isn't labeled, infer from first unlabeled token.
+    """
+    fields = {"Type": "", "QTY": "", "Finish": "", "Size": ""}
+    s = (link_text or "").replace("\n", " | ").strip()
+    if not s:
+        return fields
+
+    parts = []
+    for chunk in s.split("|"):
+        subs = [x.strip() for x in chunk.split(";")]
+        parts.extend([x for x in subs if x])
+
+    for tok in parts:
+        m = TYPE_RE.match(tok)
+        if m and not fields["Type"]:
+            fields["Type"] = m.group(1).strip(); continue
+        m = QTY_RE.match(tok)
+        if m and not fields["QTY"]:
+            q = m.group(1).strip()
+            fields["QTY"] = "" if q.upper() == "XX" else q
+            continue
+        m = FINISH_RE.match(tok)
+        if m and not fields["Finish"]:
+            fields["Finish"] = m.group(1).strip(); continue
+        m = SIZE_RE.match(tok)
+        if m and not fields["Size"]:
+            fields["Size"] = m.group(1).strip(); continue
+
+    if not fields["Type"]:
+        for tok in parts:
+            if ":" in tok:
+                continue
+            if tok.strip():
+                fields["Type"] = tok.strip()
+                break
+
+    if fields["Size"]:
+        fields["Size"] = re.sub(r"\s*[xX]\s*", " x ", fields["Size"]).strip()
+
+    return fields
+
+# Strict per-link title capture
+def extract_link_title_strict(page, rect, pad_px: float = 2.0, band_px: float = 18.0) -> str:
+    """
+    Capture text for this link only.
+    - Primary: words whose center lies inside (rect ± pad_px)
+    - If empty: a thin horizontal band around the rect to catch labels just outside the box.
+    """
+    import fitz
+    def norm(s: str) -> str:
+        s = re.sub(r"\s*\|\s*", " | ", s)
+        s = re.sub(r"\s*;\s*", "; ", s)
+        s = re.sub(r"\s{2,}", " ", s)
+        return s.strip()
+
+    if not rect:
+        return ""
+
+    r = fitz.Rect(rect).normalize()
+    R = fitz.Rect(r.x0 - pad_px, r.y0 - pad_px, r.x1 + pad_px, r.y1 + pad_px)
+
+    raw = page.get_text("rawdict") or {}
+    words = []
+    for blk in raw.get("blocks", []):
+        if blk.get("type") != 0:
+            continue
+        for line in blk.get("lines", []):
+            for span in line.get("spans", []):
+                tx = span.get("text", "")
+                bbox = span.get("bbox", None)
+                if not tx or not bbox:
+                    continue
+                x0, y0, x1, y1 = bbox
+                cx = (x0 + x1) / 2.0
+                cy = (y0 + y1) / 2.0
+                words.append((cx, cy, x0, y0, x1, y1, tx))
+
+    kept = [(y0, x0, tx) for cx, cy, x0, y0, x1, y1, tx in words
+            if R.contains(fitz.Point(cx, cy)) and tx]
+
+    if not kept:
+        band = fitz.Rect(r.x0, r.y0 - band_px, r.x1, r.y1 + band_px)
+        kept = []
+        for cx, cy, x0, y0, x1, y1, tx in words:
+            if not tx:
+                continue
+            cy_in = (band.y0 <= cy <= band.y1)
+            x_overlaps = not (x1 < r.x0 or x0 > r.x1)
+            if cy_in and x_overlaps:
+                kept.append((y0, x0, tx))
+
+    if not kept:
+        return ""
+
+    kept.sort(key=lambda t: (round(t[0], 3), t[1]))
+    return norm(" ".join(t[2] for t in kept))
+
+# Position at start of title; trim if next bullet was accidentally captured
+POS_AT_START = re.compile(r'^\s*(\d{1,3})[.\u2024\u00B7]?\s*')
+NEXT_BULLET  = re.compile(r'\s(\d{1,3})[.\u2024\u00B7](?=\s|[A-Z])')
+
+def split_position_and_title_start(raw: str) -> tuple[str, str]:
+    s = (raw or "").strip()
+    if not s:
+        return "", ""
+    m = POS_AT_START.match(s)
+    if not m:
+        return "", s
+    pos = m.group(1)
+    rest = s[m.end():].strip()
+    m2 = NEXT_BULLET.search(rest)
+    if m2:
+        rest = rest[:m2.start()].strip()
+    return pos, rest
+
+def extract_links_by_pages(
+    pdf_bytes: bytes,
+    page_to_tag: dict[int, str] | None,
+    only_listed_pages: bool = True,
+    pad_px: float = 2.0,
+    band_px: float = 18.0,
+) -> pd.DataFrame:
+    doc = fitz.open("pdf", pdf_bytes)
+    rows = []
+    listed = set(page_to_tag.keys()) if page_to_tag else set()
+
+    for pidx, page in enumerate(doc, start=1):
+        if only_listed_pages and page_to_tag and pidx not in listed:
+            continue
+        tag_value = (page_to_tag or {}).get(pidx, "")
+
+        for lnk in page.get_links():
+            uri = (lnk.get("uri") or "").strip()
+            if not uri.lower().startswith(("http://", "https://")):
+                continue
+
+            rect = lnk.get("from")
+            raw = extract_link_title_strict(page, rect, pad_px=pad_px, band_px=band_px)
+            position, title = split_position_and_title_start(raw)
+            fields = parse_link_title_fields(title)
+
+            rows.append({
+                "page": pidx,
+                "Tags": tag_value,
+                "Position": position,
+                "Type": fields.get("Type",""),
+                "QTY": fields.get("QTY",""),
+                "Finish": fields.get("Finish",""),
+                "Size": fields.get("Size",""),
+                "link_url": uri,     # full URL
+                "link_text": title,  # per-link title (not merged)
+            })
+
+    return pd.DataFrame(rows)
+
+# ========================= Tabs 2/3: Your Firecrawl + parsers =========================
 def pick_image_and_price_bs4(html: str, base_url: str) -> Tuple[str, str]:
     """Lightweight fallback: og/twitter → JSON-LD → meta → visible $ pattern."""
     soup = BeautifulSoup(html or "", "lxml")
-    # image via og/twitter/json-ld/fallback
     img_url = ""
     for sel in [("meta", {"property":"og:image"}), ("meta", {"name":"og:image"}),
                 ("meta", {"name":"twitter:image"}), ("meta", {"property":"twitter:image"})]:
@@ -88,11 +239,9 @@ def pick_image_and_price_bs4(html: str, base_url: str) -> Tuple[str, str]:
             except Exception:
                 pass
     if not img_url:
-        # first <img>
         anyimg = soup.find("img", src=True)
         if anyimg: img_url = urljoin(base_url, anyimg["src"])
 
-    # price via JSON-LD/meta/visible
     price = ""
     for tag in soup.find_all("script", type="application/ld+json"):
         try:
@@ -127,15 +276,6 @@ LUMENS_PDP_RE = re.compile(
     r'https://images\.lumens\.com/is/image/Lumens/[A-Za-z0-9_/-]+?\?\$Lumens\.com-PDP-large\$', re.I
 )
 
-def canonicalize_url(u: str) -> str:
-    try:
-        p = urlparse(u)
-        q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
-             if not k.lower().startswith(("utm_", "gclid", "gbraid", "wbraid", "msclkid", "mc_"))]
-        return urlunparse((p.scheme, p.netloc, p.path, p.params, urlencode(q), ""))
-    except Exception:
-        return u
-
 def _largest_from_srcset(srcset_value: str) -> str:
     best_url, best_w = "", -1
     for part in (srcset_value or "").split(","):
@@ -156,24 +296,20 @@ def _largest_from_srcset(srcset_value: str) -> str:
 
 def _first_lumens_pdp_large_from_html(html: str) -> str:
     if not html: return ""
-    # 1) direct regex hit anywhere in HTML
     m = LUMENS_PDP_RE.search(html)
     if m: return m.group(0)
 
     soup = BeautifulSoup(html, "lxml")
-    # 2) <img ... data-src=...> with PDP-large
     for im in soup.find_all("img"):
         for attr in ("data-src", "data-original", "data-zoom-image", "data-large_image", "src"):
             v = im.get(attr)
             if isinstance(v, str) and "$Lumens.com-PDP-large$" in v:
                 return v
-        # srcset variants
         ss = im.get("srcset") or im.get("data-srcset")
         if isinstance(ss, str) and "$Lumens.com-PDP-large$" in ss:
             cand = _largest_from_srcset(ss)
             if cand: return cand
 
-    # 3) <picture><source srcset=...>
     for pict in soup.find_all("picture"):
         for src in pict.find_all("source"):
             ss = src.get("srcset") or src.get("data-srcset")
@@ -181,7 +317,6 @@ def _first_lumens_pdp_large_from_html(html: str) -> str:
                 cand = _largest_from_srcset(ss)
                 if cand: return cand
 
-    # 4) <link rel="preload" as="image">
     preload = soup.find("link", rel=lambda v: v and "preload" in v, attrs={"as": "image"})
     if preload and isinstance(preload.get("href"), str) and "$Lumens.com-PDP-large$" in preload["href"]:
         return preload["href"]
@@ -196,7 +331,6 @@ def parse_image_and_price_lumens_from_v2(scrape: dict) -> Tuple[str, str]:
     html = data.get("html") or ""
     md   = data.get("markdown") or ""
 
-    # --- IMAGE (Markdown first, then HTML) ---
     img = ""
     if isinstance(md, str):
         m = LUMENS_PDP_RE.search(md)
@@ -205,9 +339,7 @@ def parse_image_and_price_lumens_from_v2(scrape: dict) -> Tuple[str, str]:
     if not img:
         img = _first_lumens_pdp_large_from_html(html)
 
-    # --- PRICE ---
     price = ""
-    # Try JSON block (if you add schema later)
     j = data.get("json")
     if isinstance(j, dict):
         content = j.get("content") if isinstance(j.get("content"), dict) else j
@@ -216,7 +348,6 @@ def parse_image_and_price_lumens_from_v2(scrape: dict) -> Tuple[str, str]:
 
     if not price and html:
         soup = BeautifulSoup(html or "", "lxml")
-        # JSON-LD
         for tag in soup.find_all("script", type="application/ld+json"):
             try:
                 obj = json.loads(tag.string or "")
@@ -282,7 +413,6 @@ def firecrawl_scrape_v2(url: str, api_key: str, mode: str = "simple") -> dict:
             json=payload, timeout=75
         )
         if r.status_code >= 400:
-            # Return {} so the caller can fall back cleanly
             return {}
         return r.json()
     except Exception:
@@ -334,6 +464,7 @@ def enrich_domain_firecrawl_v2(url: str, api_key: str) -> Tuple[str, str, str]:
     return img, price, status
 
 def enrich_wayfair_v2(url: str, api_key: str) -> Tuple[str, str, str]:
+    # (From your version: reuses generic flow)
     return enrich_domain_firecrawl_v2(url, api_key)
 
 def enrich_ferguson_v2(url: str, api_key: str) -> Tuple[str, str, str]:
@@ -365,121 +496,77 @@ with st.sidebar:
 
 # ----------------- Tabs -----------------
 tab1, tab2, tab3 = st.tabs([
-    "1) Extract from PDF",
+    "1) Extract from PDF (pages + Tags + Position + full titles)",
     "2) Enrich CSV (Image URL + Price)",
     "3) Test single URL"
 ])
 
-# ----------------- Batch enrich -----------------
-def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str]) -> pd.DataFrame:
-    """
-    Add scraped_image_url and price; Firecrawl v2 first (if key), fallback to bs4,
-    with live progress bar + ETA.
-    """
-    out = df.copy()
-    if url_col not in out.columns:
-        if len(out.columns) >= 2:
-            url_col = out.columns[1]
-        else:
-            st.error(f"URL column '{url_col}' not found.")
-            return out
-
-    urls = out[url_col].astype(str).fillna("").tolist()
-    if "scraped_image_url" in out.columns and "price" in out.columns:
-        mask_done = out["scraped_image_url"].astype(str).ne("") & out["price"].astype(str).ne("")
-    else:
-        mask_done = pd.Series([False]*len(out), index=out.index)
-
-    idxs = [i for i, done in enumerate(mask_done) if not done]
-
-    imgs   = out.get("scraped_image_url", pd.Series([""]*len(out))).astype(str).tolist()
-    prices = out.get("price",               pd.Series([""]*len(out))).astype(str).tolist()
-    status = out.get("scrape_status",       pd.Series([""]*len(out))).astype(str).tolist()
-
-    api_key = (api_key or "").strip()
-
-    prog = st.progress(0)
-    status_box = st.empty()
-    t_start = time.perf_counter()
-    per_link_times = []
-
-    for k, i in enumerate(idxs, start=1):
-        u = urls[i].strip()
-        if not u:
-            imgs[i] = ""; prices[i] = ""; status[i] = "no_url"
-            prog.progress(k/len(idxs))
-            continue
-
-        with Timer() as t:
-            img = price = ""; st_code = ""
-            if api_key:
-                if "lumens.com" in u:
-                    img, price, st_code = enrich_lumens_v2(u, api_key)
-                elif "fergusonhome.com" in u:
-                    img, price, st_code = enrich_ferguson_v2(u, api_key)
-                elif "wayfair.com" in u:
-                    img, price, st_code = enrich_wayfair_v2(u, api_key)
-                else:
-                    img, price, st_code = enrich_domain_firecrawl_v2(u, api_key)
-
-            if not img or not price:
-                r = requests_get(u)
-                if r and r.text:
-                    i2, p2 = pick_image_and_price_bs4(r.text, u)
-                    img = img or i2
-                    price = price or p2
-                    st_code = (st_code + "+bs4_ok") if st_code else "bs4_ok"
-                else:
-                    st_code = (st_code + "+fetch_failed") if st_code else "fetch_failed"
-
-            imgs[i] = img
-            prices[i] = price
-            status[i] = st_code
-
-        per_link_times.append(t.dt)
-        avg = sum(per_link_times) / max(len(per_link_times), 1)
-        remaining = (len(idxs) - k) * avg
-        status_box.write(
-            f"Processed {k}/{len(idxs)} • last {t.dt:.2f}s • avg {avg:.2f}s/link • ETA ~{int(remaining)}s"
-        )
-        prog.progress(k/len(idxs))
-        time.sleep(0.10)
-
-    total = time.perf_counter() - t_start
-    if idxs:
-        status_box.write(f"Done {len(idxs)} link(s) in {total:.1f}s • avg {(total/len(idxs)):.2f}s/link")
-    else:
-        status_box.write("Nothing to do — all rows already enriched.")
-
-    out["scraped_image_url"] = imgs
-    out["price"] = prices
-    out["scrape_status"] = status
-    return out
-
-# --- Tab 1: PDF → Links ---
+# --- Tab 1: Canva PDF → rows ---
 with tab1:
-    st.caption("Upload a PDF → extract all web links with project/sheet info → download a CSV.")
-    uploaded_pdf = st.file_uploader("Upload a PDF", type="pdf", key="pdf_uploader")
-    if uploaded_pdf:
-        st.info(f"File uploaded: {uploaded_pdf.name}")
-        if st.button("Extract Links", key="extract_btn"):
-            with st.spinner("Extracting links..."):
-                pdf_bytes = uploaded_pdf.read()
-                result_df = extract_links_from_pdf(pdf_bytes)
-            if result_df.empty:
-                st.warning("No links found in this PDF.")
-            else:
-                st.success("Done! ✅")
-                st.dataframe(result_df, use_container_width=True)
-                csv_bytes = result_df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "Download results CSV",
-                    data=csv_bytes,
-                    file_name=f"{uploaded_pdf.name}_links.csv",
-                    mime="text/csv",
-                )
+    st.caption("Build a page→Tags table, then extract ALL web links on those pages. Each link stays on its own row.")
+    pdf_file = st.file_uploader("Upload PDF", type="pdf", key="pdf_extractor")
+    num_pages = None
+    if pdf_file:
+        try:
+            _peek = fitz.open("pdf", pdf_file.getvalue())
+            num_pages = len(_peek)
+            st.info(f"PDF detected with **{num_pages}** page(s).")
+        except Exception as e:
+            st.error(f"Could not read PDF: {e}")
 
-# --- Tab 2: Enrich CSV ---
+    st.markdown("**Page → Tags table**")
+    default_df = pd.DataFrame([{"page": "", "Tags": ""}])
+    mapping_df = st.data_editor(
+        default_df, num_rows="dynamic", use_container_width=True, key="page_tag_editor",
+        column_config={
+            "page": st.column_config.TextColumn("page", help="Page number (1-based)"),
+            "Tags": st.column_config.TextColumn("Tags", help="Room name for that page"),
+        }
+    )
+    only_listed = st.checkbox("Only extract pages listed above", value=True)
+    pad_px = st.slider("Link capture pad (pixels)", 0, 10, 2, 1)
+    band_px = st.slider("Nearby text band (pixels)", 0, 40, 18, 2)
+
+    run1 = st.button("Extract", type="primary", disabled=(pdf_file is None), key="extract_btn")
+    if run1 and pdf_file:
+        page_to_tag = {}
+        if num_pages is None:
+            try:
+                num_pages = len(fitz.open("pdf", pdf_file.getvalue()))
+            except:
+                num_pages = None
+        for _, row in mapping_df.iterrows():
+            p_raw = str(row.get("page","")).strip()
+            t_raw = str(row.get("Tags","")).strip()
+            if not p_raw: continue
+            try:
+                p_no = int(p_raw)
+                if p_no >= 1 and (num_pages is None or p_no <= num_pages):
+                    page_to_tag[p_no] = t_raw
+            except:
+                continue
+
+        pdf_bytes = pdf_file.read()
+        with st.spinner("Extracting links, positions & titles…"):
+            df = extract_links_by_pages(
+                pdf_bytes, page_to_tag,
+                only_listed_pages=only_listed,
+                pad_px=pad_px,
+                band_px=band_px
+            )
+        if df.empty:
+            st.info("No links found. Verify the PDF uses live hyperlinks (not just images).")
+        else:
+            st.success(f"Extracted {len(df)} row(s).")
+            st.dataframe(df, use_container_width=True)
+            st.download_button(
+                "Download CSV",
+                df.to_csv(index=False).encode("utf-8"),
+                file_name="canva_links_with_position.csv",
+                mime="text/csv"
+            )
+
+# --- Tab 2: Enrich CSV (your version preserved) ---
 with tab2:
     st.caption("Provide a CSV with a 'Product URL' column (or the 2nd column will be used).")
     csv_file = st.file_uploader("Upload links CSV", type=["csv"], key="csv_uploader")
@@ -495,6 +582,87 @@ with tab2:
             url_col_guess = "Product URL" if "Product URL" in df_in.columns else df_in.columns[min(1, len(df_in)-1)]
             url_col = st.text_input("URL column name", url_col_guess)
 
+            def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str]) -> pd.DataFrame:
+                out = df.copy()
+                if url_col not in out.columns:
+                    if len(out.columns) >= 2:
+                        url_col = out.columns[1]
+                    else:
+                        st.error(f"URL column '{url_col}' not found.")
+                        return out
+
+                urls = out[url_col].astype(str).fillna("").tolist()
+                if "scraped_image_url" in out.columns and "price" in out.columns:
+                    mask_done = out["scraped_image_url"].astype(str).ne("") & out["price"].astype(str).ne("")
+                else:
+                    mask_done = pd.Series([False]*len(out), index=out.index)
+
+                idxs = [i for i, done in enumerate(mask_done) if not done]
+
+                imgs   = out.get("scraped_image_url", pd.Series([""]*len(out))).astype(str).tolist()
+                prices = out.get("price",               pd.Series([""]*len(out))).astype(str).tolist()
+                status = out.get("scrape_status",       pd.Series([""]*len(out))).astype(str).tolist()
+
+                api_key = (api_key or "").strip()
+
+                prog = st.progress(0)
+                status_box = st.empty()
+                t_start = time.perf_counter()
+                per_link_times = []
+
+                for k, i in enumerate(idxs, start=1):
+                    u = urls[i].strip()
+                    if not u:
+                        imgs[i] = ""; prices[i] = ""; status[i] = "no_url"
+                        prog.progress(k/len(idxs))
+                        continue
+
+                    with Timer() as t:
+                        img = price = ""; st_code = ""
+                        if api_key:
+                            if "lumens.com" in u:
+                                img, price, st_code = enrich_lumens_v2(u, api_key)
+                            elif "fergusonhome.com" in u:
+                                img, price, st_code = enrich_ferguson_v2(u, api_key)
+                            elif "wayfair.com" in u:
+                                img, price, st_code = enrich_wayfair_v2(u, api_key)
+                            else:
+                                img, price, st_code = enrich_domain_firecrawl_v2(u, api_key)
+
+                        if not img or not price:
+                            r = requests_get(u)
+                            if r and r.text:
+                                i2, p2 = pick_image_and_price_bs4(r.text, u)
+                                img = img or i2
+                                price = price or p2
+                                st_code = (st_code + "+bs4_ok") if st_code else "bs4_ok"
+                            else:
+                                st_code = (st_code + "+fetch_failed") if st_code else "fetch_failed"
+
+                        imgs[i] = img
+                        prices[i] = price
+                        status[i] = st_code
+
+                    per_link_times.append(t.dt)
+                    avg = sum(per_link_times) / max(len(per_link_times), 1)
+                    remaining = (len(idxs) - k) * avg
+                    status_box.write(
+                        f"Processed {k}/{len(idxs)} • last {t.dt:.2f}s • avg {avg:.2f}s/link • ETA ~{int(remaining)}s"
+                    )
+                    prog.progress(k/len(idxs))
+                    time.sleep(0.10)
+
+                total = time.perf_counter() - t_start
+                if idxs:
+                    status_box.write(f"Done {len(idxs)} link(s) in {total:.1f}s • avg {(total/len(idxs)):.2f}s/link")
+                else:
+                    status_box.write("Nothing to do — all rows already enriched.")
+
+                out["scraped_image_url"] = imgs
+                out["price"] = prices
+                out["scrape_status"] = status
+                return out
+
             if st.button("Enrich (Image URL + Price)", key="enrich_btn"):
                 with st.spinner("Scraping image + price..."):
                     df_out = enrich_urls(df_in, url_col, api_key_input)
@@ -509,7 +677,7 @@ with tab2:
                     mime="text/csv",
                 )
 
-# --- Tab 3: Test a single URL ---
+# --- Tab 3: Test a single URL (your version preserved) ---
 with tab3:
     st.caption("Paste a single product URL and test the enrichment (Firecrawl v2 first, then fallback).")
     test_url = st.text_input(
