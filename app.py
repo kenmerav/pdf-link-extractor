@@ -48,17 +48,13 @@ def canonicalize_url(u: str) -> str:
         return u
 
 # ========================= TAB 1: Canva PDF extractor =========================
-# Parse fields from FULL link title text
+import re
 QTY_RE     = re.compile(r"^(?:QTY|Qty|qty|Quantity)\s*:\s*([0-9Xx]+)\s*$")
 FINISH_RE  = re.compile(r"^(?:FINISH|Finish)\s*:\s*(.+)$")
 SIZE_RE    = re.compile(r"^(?:SIZE|Size|Dimensions?)\s*:\s*(.+)$")
 TYPE_RE    = re.compile(r"^(?:TYPE|Type)\s*:\s*(.+)$")
 
 def parse_link_title_fields(link_text: str) -> dict:
-    """
-    Parse 'PENDANT | QTY: 1 | FINISH: Brass, White | SIZE: 48"' style strings.
-    Accepts pipes or semicolons. If Type isn't labeled, infer from first unlabeled token.
-    """
     fields = {"Type": "", "QTY": "", "Finish": "", "Size": ""}
     s = (link_text or "").replace("\n", " | ").strip()
     if not s:
@@ -87,7 +83,7 @@ def parse_link_title_fields(link_text: str) -> dict:
 
     if not fields["Type"]:
         for tok in parts:
-            if ":" in tok:
+            if ":" in tok: 
                 continue
             if tok.strip():
                 fields["Type"] = tok.strip()
@@ -98,13 +94,8 @@ def parse_link_title_fields(link_text: str) -> dict:
 
     return fields
 
-# Strict per-link title capture
 def extract_link_title_strict(page, rect, pad_px: float = 2.0, band_px: float = 18.0) -> str:
-    """
-    Capture text for this link only.
-    - Primary: words whose center lies inside (rect ± pad_px)
-    - If empty: a thin horizontal band around the rect to catch labels just outside the box.
-    """
+    """Take only text that truly belongs to this link (no merging)."""
     import fitz
     def norm(s: str) -> str:
         s = re.sub(r"\s*\|\s*", " | ", s)
@@ -114,7 +105,6 @@ def extract_link_title_strict(page, rect, pad_px: float = 2.0, band_px: float = 
 
     if not rect:
         return ""
-
     r = fitz.Rect(rect).normalize()
     R = fitz.Rect(r.x0 - pad_px, r.y0 - pad_px, r.x1 + pad_px, r.y1 + pad_px)
 
@@ -126,7 +116,7 @@ def extract_link_title_strict(page, rect, pad_px: float = 2.0, band_px: float = 
         for line in blk.get("lines", []):
             for span in line.get("spans", []):
                 tx = span.get("text", "")
-                bbox = span.get("bbox", None)
+                bbox = span.get("bbox")
                 if not tx or not bbox:
                     continue
                 x0, y0, x1, y1 = bbox
@@ -150,11 +140,9 @@ def extract_link_title_strict(page, rect, pad_px: float = 2.0, band_px: float = 
 
     if not kept:
         return ""
-
     kept.sort(key=lambda t: (round(t[0], 3), t[1]))
     return norm(" ".join(t[2] for t in kept))
 
-# Position at start of title; trim if next bullet was accidentally captured
 POS_AT_START = re.compile(r'^\s*(\d{1,3})[.\u2024\u00B7]?\s*')
 NEXT_BULLET  = re.compile(r'\s(\d{1,3})[.\u2024\u00B7](?=\s|[A-Z])')
 
@@ -179,6 +167,7 @@ def extract_links_by_pages(
     pad_px: float = 2.0,
     band_px: float = 18.0,
 ) -> pd.DataFrame:
+    """STRICT extractor used by Tab 1."""
     doc = fitz.open("pdf", pdf_bytes)
     rows = []
     listed = set(page_to_tag.keys()) if page_to_tag else set()
@@ -206,11 +195,11 @@ def extract_links_by_pages(
                 "QTY": fields.get("QTY",""),
                 "Finish": fields.get("Finish",""),
                 "Size": fields.get("Size",""),
-                "link_url": uri,     # full URL
-                "link_text": title,  # per-link title (not merged)
+                "link_url": uri,
+                "link_text": title,
             })
-
     return pd.DataFrame(rows)
+
 
 # ========================= Tabs 2/3: Your Firecrawl + parsers =========================
 def pick_image_and_price_bs4(html: str, base_url: str) -> Tuple[str, str]:
@@ -711,3 +700,4 @@ with tab3:
         st.write("**Price:**", price or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
