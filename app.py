@@ -184,6 +184,24 @@ ROOM_MAP_RAW = [
 # build a lowercase lookup dict for exact/starts-with style checks
 ROOM_MAP = {k.lower(): v for (k, v) in ROOM_MAP_RAW}
 
+# High-level room options exposed to the user in the editable dropdown
+ROOM_CHOICES = [
+    "Plumbing",
+    "Lighting",
+    "Tile + Stone",
+    "Countertops + Slabs",
+    "Doors, Base, Case",
+    "Wall Coverings",
+    "Paint",
+    "Cabinetry Finishes",
+    "Hardware",
+    "Accent Mirrors",
+    "Appliances",
+    "Other Materials",
+    "Unassigned",
+]
+
+
 def _infer_room_from_type(type_val: str) -> str:
     """
     Given the parsed "Type" (ex: "Sink", "Pendant", etc.),
