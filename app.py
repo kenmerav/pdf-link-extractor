@@ -635,7 +635,15 @@ with tab1:
 
         # 1. Prefer the most recent edits from the data_editor widget itself,
         #    so selections don't snap back to 'Unassigned' on rerun.
-        latest_df = st.session_state.get("extracted_links_editor", st.session_state["spec_df"])
+        raw_latest = st.session_state.get("extracted_links_editor", st.session_state["spec_df"])
+        # Sometimes Streamlit stores the editor state as a dict before first DF return.
+        if isinstance(raw_latest, dict):
+            try:
+                latest_df = pd.DataFrame(raw_latest)
+            except Exception:
+                latest_df = st.session_state["spec_df"].copy()
+        else:
+            latest_df = raw_latest.copy() if isinstance(raw_latest, pd.DataFrame) else st.session_state["spec_df"].copy()
 
         # 2. Render editor using the latest_df so reruns preserve choices
         edited_df = st.data_editor(
