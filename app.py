@@ -573,7 +573,10 @@ with tab1:
     st.markdown("**Page → Tags table**")
     default_df = pd.DataFrame([{"page": "", "Tags": ""}])
     mapping_df = st.data_editor(
-        default_df, num_rows="dynamic", use_container_width=True, key="page_tag_editor",
+        default_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="page_tag_editor",
         column_config={
             "page": st.column_config.TextColumn("page", help="Page number (1-based)"),
             "Tags": st.column_config.TextColumn("Tags", help="Room name for that page"),
@@ -592,9 +595,10 @@ with tab1:
             except:
                 num_pages = None
         for _, row in mapping_df.iterrows():
-            p_raw = str(row.get("page","")).strip()
-            t_raw = str(row.get("Tags","")).strip()
-            if not p_raw: continue
+            p_raw = str(row.get("page", "")).strip()
+            t_raw = str(row.get("Tags", "")).strip()
+            if not p_raw:
+                continue
             try:
                 p_no = int(p_raw)
                 if p_no >= 1 and (num_pages is None or p_no <= num_pages):
@@ -605,24 +609,42 @@ with tab1:
         pdf_bytes = pdf_file.read()
         with st.spinner("Extracting links, positions & titles…"):
             df = extract_links_by_pages(
-                pdf_bytes, page_to_tag,
+                pdf_bytes,
+                page_to_tag,
                 only_listed_pages=only_listed,
                 pad_px=pad_px,
-                band_px=band_px
+                band_px=band_px,
             )
         if df.empty:
             st.info("No links found. Verify the PDF uses live hyperlinks (not just images).")
         else:
             st.success(f"Extracted {len(df)} row(s).")
-            st.dataframe(df, use_container_width=True)
-            st.download_button(
-                "Download CSV",
-                df.to_csv(index=False).encode("utf-8"),
-                file_name="canva_links_with_position.csv",
-                mime="text/csv"
+
+            # default Room = Unassigned if blank
+            df["Room"] = df["Room"].where(df["Room"].ne(""), "Unassigned").fillna("Unassigned")
+
+            # Editable grid with dropdown for Room
+            edited_df = st.data_editor(
+                df,
+                use_container_width=True,
+                num_rows="dynamic",
+                key="extracted_links_editor",
+                column_config={
+                    "Room": st.column_config.SelectboxColumn(
+                        "Room",
+                        help="Assign category for this spec item",
+                        options=ROOM_CHOICES,
+                    )
+                },
             )
 
-# --- Tab 2: Enrich CSV (your version preserved) ---
+            st.download_button(
+                "Download CSV",
+                edited_df.to_csv(index=False).encode("utf-8"),
+                file_name="canva_links_with_position.csv",
+                mime="text/csv",
+            )
+
 with tab2:
     st.caption("Provide a CSV with a 'Product URL' column (or the 2nd column will be used).")
     csv_file = st.file_uploader("Upload links CSV", type=["csv"], key="csv_uploader")
