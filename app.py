@@ -662,11 +662,6 @@ with tab1:
             file_name="canva_links_with_position.csv",
             mime="text/csv",
         )
-            "Download CSV",
-            edited_df.to_csv(index=False).encode("utf-8"),
-            file_name="canva_links_with_position.csv",
-            mime="text/csv",
-        )
 
 with tab2:
     st.caption("Provide a CSV with a 'Product URL' column (or the 2nd column will be used).")
