@@ -571,7 +571,29 @@ with tab1:
             st.error(f"Could not read PDF: {e}")
 
     st.markdown("**Page → Tags table**")
-    default_df = pd.DataFrame([{"page": "", "Tags": ""}])
+
+    # --- Persist the Page→Tags mapping editor so it doesn't reset every rerun ---
+    # If the user already typed rows into the Page→Tags table, Streamlit stores
+    # that under session_state["page_tag_editor"]. We want to show those values
+    # instead of wiping back to an empty default_df on each rerun.
+    if "page_tag_editor" in st.session_state and isinstance(st.session_state["page_tag_editor"], (pd.DataFrame, dict)):
+        prev_map = st.session_state["page_tag_editor"]
+        if isinstance(prev_map, dict):
+            try:
+                prev_map_df = pd.DataFrame(prev_map)
+            except Exception:
+                prev_map_df = pd.DataFrame([{"page": "", "Tags": ""}])
+        else:
+            prev_map_df = prev_map.copy()
+        # enforce the two columns we care about
+        if "page" not in prev_map_df.columns:
+            prev_map_df["page"] = ""
+        if "Tags" not in prev_map_df.columns:
+            prev_map_df["Tags"] = ""
+        default_df = prev_map_df[["page", "Tags"]]
+    else:
+        default_df = pd.DataFrame([{"page": "", "Tags": ""}])
+
     mapping_df = st.data_editor(
         default_df,
         num_rows="dynamic",
@@ -582,6 +604,7 @@ with tab1:
             "Tags": st.column_config.TextColumn("Tags", help="Room name for that page"),
         }
     )
+
     only_listed = st.checkbox("Only extract pages listed above", value=True)
     pad_px = st.slider("Link capture pad (pixels)", 0, 16, 4, 1)
     band_px = st.slider("Nearby text band (pixels)", 0, 60, 28, 2)
