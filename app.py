@@ -626,30 +626,55 @@ if run1 and st.session_state.get("pdf_bytes"):
 
 # Always render editable table if we have data
 if st.session_state.get("extracted_df") is not None:
-    st.caption("Edit the Room per row if needed, then download your CSV.")
+    st.caption("Edit the Room per row if needed, then click **Save room edits**. When you're done, download the CSV.")
+
     # Make a safe, string-typed copy to ensure Selectbox works for all choices (incl. "Plumbing")
     df_show = st.session_state["extracted_df"].copy()
     if "Room" not in df_show.columns:
         df_show["Room"] = ""
-    df_show["Room"] = df_show["Room"].astype(str).fillna("").replace({"nan": ""})
-
-    edited_df = st.data_editor(
-        df_show,
-        key="links_editor",
-        use_container_width=True,
-        column_config={
-            "Room": st.column_config.SelectboxColumn(
-                "Room",
-                options=ROOM_OPTIONS,
-                help="Choose a room/category or leave blank",
-            )
-        },
+    df_show["Room"] = (
+        df_show["Room"].astype(str).fillna("").replace({"nan": ""})
     )
-    st.session_state["extracted_df"] = edited_df
 
+    # Build column configs so only Room is editable; other columns are view-only.
+    col_cfg = {
+        "Room": st.column_config.SelectboxColumn(
+            "Room",
+            options=ROOM_OPTIONS,
+            help="Choose a room/category or leave blank",
+        ),
+        "page": st.column_config.TextColumn("page", disabled=True),
+        "Tags": st.column_config.TextColumn("Tags", disabled=True),
+        "Position": st.column_config.TextColumn("Position", disabled=True),
+        "Type": st.column_config.TextColumn("Type", disabled=True),
+        "QTY": st.column_config.TextColumn("QTY", disabled=True),
+        "Finish": st.column_config.TextColumn("Finish", disabled=True),
+        "Size": st.column_config.TextColumn("Size", disabled=True),
+        "link_url": st.column_config.TextColumn("link_url", disabled=True),
+        "link_text": st.column_config.TextColumn("link_text", disabled=True),
+    }
+
+    # Use a form so edits only apply when you click Save, avoiding partial rerun glitches
+    with st.form("room_editor"):
+        edited_df = st.data_editor(
+            df_show,
+            key="links_editor",
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",  # lock row count to prevent accidental adds/deletes
+            column_config=col_cfg,
+        )
+        saved = st.form_submit_button("Save room edits", type="primary")
+
+    if saved:
+        # Persist only when you click Save
+        st.session_state["extracted_df"] = edited_df
+        st.success("Room edits saved.")
+
+    # Always show the latest saved data for download
     st.download_button(
         "Download CSV",
-        edited_df.to_csv(index=False).encode("utf-8"),
+        st.session_state["extracted_df"].to_csv(index=False).encode("utf-8"),
         file_name="canva_links_with_position.csv",
         mime="text/csv",
     )
