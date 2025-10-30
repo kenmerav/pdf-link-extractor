@@ -589,51 +589,56 @@ with tab1:
     pad_px = st.slider("Link capture pad (pixels)", 0, 16, 4, 1)
     band_px = st.slider("Nearby text band (pixels)", 0, 60, 28, 2)
 
-    run1 = st.button("Extract", type="primary", disabled=(pdf_file is None), key="extract_btn")
-    if run1 and pdf_file:
-        page_to_tag = {}
-        if num_pages is None:
-            try:
-                num_pages = len(fitz.open("pdf", pdf_file.getvalue()))
-            except:
-                num_pages = None
-        for _, row in mapping_df.iterrows():
-            p_raw = str(row.get("page","")); p_raw = p_raw.strip()
-            t_raw = str(row.get("Tags","")); t_raw = t_raw.strip()
-            if not p_raw: continue
-            try:
-                p_no = int(p_raw)
-                if p_no >= 1 and (num_pages is None or p_no <= num_pages):
-                    page_to_tag[p_no] = t_raw
-            except:
-                continue
+    run1 = st.button("Extract", type="primary", disabled=(st.session_state.get("pdf_bytes") is None), key="extract_btn")
+if run1 and st.session_state.get("pdf_bytes"):
+    # Build mapping from editor
+    page_to_tag = {}
+    num_pages = st.session_state.get("num_pages")
+    for _, row in mapping_df.iterrows():
+        p_raw = str(row.get("page", "")).strip()
+        t_raw = str(row.get("Tags", "")).strip()
+        if not p_raw:
+            continue
+        try:
+            p_no = int(p_raw)
+            if p_no >= 1 and (num_pages is None or p_no <= num_pages):
+                page_to_tag[p_no] = t_raw
+        except Exception:
+            continue
 
-        pdf_bytes = pdf_file.read()
-        with st.spinner("Extracting links, positions & titles…"):
-            df = extract_links_by_pages(
-                pdf_bytes, page_to_tag, None,
-                only_listed_pages=only_listed,
-                pad_px=pad_px,
-                band_px=band_px
-            )
-        if df.empty:
-            st.info("No links found. Verify the PDF uses live hyperlinks (not just images).")
-        else:
-            st.success(f"Extracted {len(df)} row(s).")
-            st.caption("Edit the Room per row if needed, then download your CSV.")
-            edited_df = st.data_editor(
-                df,
-                use_container_width=True,
-                column_config={
-                    "Room": st.column_config.SelectboxColumn("Room", options=ROOM_OPTIONS, help="Choose a room/category or leave blank")
-                }
-            )
-            st.download_button(
-                "Download CSV",
-                edited_df.to_csv(index=False).encode("utf-8"),
-                file_name="canva_links_with_position.csv",
-                mime="text/csv"
-            )
+    pdf_bytes = st.session_state["pdf_bytes"]
+    with st.spinner("Extracting links, positions & titles…"):
+        df = extract_links_by_pages(
+            pdf_bytes, page_to_tag, None,
+            only_listed_pages=only_listed,
+            pad_px=pad_px,
+            band_px=band_px
+        )
+    if df.empty:
+        st.info("No links found. Verify the PDF uses live hyperlinks (not just images).")
+        st.session_state["extracted_df"] = None
+    else:
+        st.session_state["extracted_df"] = df
+        st.success(f"Extracted {len(df)} row(s). You can now edit the Room values below without losing your place.")
+
+# Always render editable table if we have data
+if st.session_state.get("extracted_df") is not None:
+    st.caption("Edit the Room per row if needed, then download your CSV.")
+    edited_df = st.data_editor(
+        st.session_state["extracted_df"],
+        key="links_editor",
+        use_container_width=True,
+        column_config={
+            "Room": st.column_config.SelectboxColumn("Room", options=ROOM_OPTIONS, help="Choose a room/category or leave blank")
+        }
+    )
+    st.session_state["extracted_df"] = edited_df
+    st.download_button(
+        "Download CSV",
+        edited_df.to_csv(index=False).encode("utf-8"),
+        file_name="canva_links_with_position.csv",
+        mime="text/csv"
+    )
 
 # --- Tab 2: Enrich CSV (your version preserved) ---
 with tab2:
