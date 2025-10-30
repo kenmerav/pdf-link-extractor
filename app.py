@@ -577,11 +577,14 @@ with tab1:
             st.error(f"Could not read PDF: {e}")
 
     st.markdown("**Page → Tags table**")
-    default_df = pd.DataFrame([{"page": "", "Tags": "", "Room": ""}])
+    default_df = pd.DataFrame([{"page": "", "Tags": ""}])
     mapping_df = st.data_editor(
         default_df, num_rows="dynamic", use_container_width=True, key="page_tag_editor",
         column_config={
             "page": st.column_config.TextColumn("page", help="Page number (1-based)"),
+            "Tags": st.column_config.TextColumn("Tags", help="Label from the PDF page (e.g., Pendant, Sink)"),
+        }
+    )"),
             "Tags": st.column_config.TextColumn("Tags", help="Label from the PDF page (e.g., Pendant, Sink)"),
             "Room": st.column_config.SelectboxColumn("Room", options=ROOM_OPTIONS, help="Pick a room/category or leave blank to auto-infer from Tags"),
         }
@@ -598,26 +601,21 @@ with tab1:
                 num_pages = len(fitz.open("pdf", pdf_file.getvalue()))
             except:
                 num_pages = None
-        page_to_room = {}
         for _, row in mapping_df.iterrows():
-            p_raw = str(row.get("page","")).strip()
-            t_raw = str(row.get("Tags","")).strip()
-            r_raw = str(row.get("Room","")).strip()
+            p_raw = str(row.get("page","")); p_raw = p_raw.strip()
+            t_raw = str(row.get("Tags","")); t_raw = t_raw.strip()
             if not p_raw: continue
             try:
                 p_no = int(p_raw)
                 if p_no >= 1 and (num_pages is None or p_no <= num_pages):
                     page_to_tag[p_no] = t_raw
-                    # if room left blank, we'll infer from tag later during extraction
-                    if r_raw:
-                        page_to_room[p_no] = r_raw
             except:
                 continue
 
         pdf_bytes = pdf_file.read()
         with st.spinner("Extracting links, positions & titles…"):
             df = extract_links_by_pages(
-                pdf_bytes, page_to_tag, page_to_room,
+                pdf_bytes, page_to_tag, None,
                 only_listed_pages=only_listed,
                 pad_px=pad_px,
                 band_px=band_px
@@ -626,10 +624,17 @@ with tab1:
             st.info("No links found. Verify the PDF uses live hyperlinks (not just images).")
         else:
             st.success(f"Extracted {len(df)} row(s).")
-            st.dataframe(df, use_container_width=True)
+            st.caption("Edit the Room per row if needed, then download your CSV.")
+            edited_df = st.data_editor(
+                df,
+                use_container_width=True,
+                column_config={
+                    "Room": st.column_config.SelectboxColumn("Room", options=ROOM_OPTIONS, help="Choose a room/category or leave blank")
+                }
+            )
             st.download_button(
                 "Download CSV",
-                df.to_csv(index=False).encode("utf-8"),
+                edited_df.to_csv(index=False).encode("utf-8"),
                 file_name="canva_links_with_position.csv",
                 mime="text/csv"
             )
