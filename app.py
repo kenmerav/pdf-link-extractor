@@ -106,10 +106,14 @@ def parse_link_title_fields(link_text: str) -> dict:
 
 def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 28.0) -> str:
     """
-    STRICT per-link capture based on per-word boxes:
-      1) Take words whose center lies inside the (slightly padded) link rect.
+    STRICT per-link capture but expanded to the *entire text line* that the link token sits on.
+    Why: In Canva, a hyperlink can be applied to just the bullet (e.g., "2.") or a single
+    token in a line. If we only keep words whose centers lie inside the rect, we can end up
+    with rows like "2." or "5" instead of the full line. This version:
+      1) Collect words whose center lies in the slightly padded rect (R).
       2) If empty, look in a thin horizontal band that overlaps X with the rect.
-      3) As a last resort, fall back to page.get_textbox(rect).
+      3) Expand to include *all words on the same (block,line)* as any kept word.
+      4) As a final fallback, use page.get_textbox(rect).
     """
     import fitz
     if not rect:
@@ -117,34 +121,49 @@ def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 
     r = fitz.Rect(rect).normalize()
     R = fitz.Rect(r.x0 - pad_px, r.y0 - pad_px, r.x1 + pad_px, r.y1 + pad_px)
 
-    words = page.get_text("words") or []  # [x0,y0,x1,y1,word,block,line,word_no]
-    kept = []
-    for x0, y0, x1, y1, w, *_ in words:
+    # words: [x0,y0,x1,y1,word,block,line,word_no]
+    words = page.get_text("words") or []
+
+    kept = []  # (y0, x0, word, block, line)
+    for x0, y0, x1, y1, w, b, ln, *_ in words:
         if not w:
             continue
         cx = (x0 + x1) / 2.0
         cy = (y0 + y1) / 2.0
         if R.contains(fitz.Point(cx, cy)):
-            kept.append((y0, x0, w))
+            kept.append((y0, x0, w, b, ln))
 
     if not kept:
         # band fallback: same Y ± band, with X overlap
         band = fitz.Rect(r.x0, r.y0 - band_px, r.x1, r.y1 + band_px)
-        for x0, y0, x1, y1, w, *_ in words:
+        for x0, y0, x1, y1, w, b, ln, *_ in words:
             if not w:
                 continue
             cy_in = band.y0 <= ((y0 + y1) / 2.0) <= band.y1
             x_overlaps = not (x1 < r.x0 or x0 > r.x1)
             if cy_in and x_overlaps:
-                kept.append((y0, x0, w))
+                kept.append((y0, x0, w, b, ln))
 
-    kept.sort(key=lambda t: (round(t[0], 3), t[1]))
-    text = " ".join(t[2] for t in kept).strip()
+    if kept:
+        # Expand to the full (block,line) of the kept word(s). Prefer the line with the most words.
+        line_keys = [(b, ln) for *_ignore, b, ln in kept]
+        # Count words per line
+        counts = {}
+        for key in line_keys:
+            counts[key] = counts.get(key, 0) + 1
+        # Pick the most represented (block,line)
+        best_key = max(counts.items(), key=lambda kv: kv[1])[0]
+        bx, lx = best_key
+        line_words = [(y0, x0, w) for x0, y0, x1, y1, w, b, ln, *_ in words if b == bx and ln == lx and w]
+        line_words.sort(key=lambda t: (round(t[0], 3), t[1]))
+        text = " ".join(t[2] for t in line_words).strip()
+    else:
+        text = ""
 
     if not text:
         # last resort: whatever the textbox returns
         try:
-            text = (page.get_textbox(r) or "").strip()
+            text = (page.get_textbox(R) or "").strip()
         except Exception:
             text = ""
 
@@ -748,3 +767,4 @@ with tab3:
         st.write("**Price:**", price or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
