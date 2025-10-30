@@ -202,6 +202,8 @@ ROOM_MAP_RAW = [
 
 # build a lowercase lookup dict for exact/starts-with style checks
 ROOM_MAP = {k.lower(): v for (k, v) in ROOM_MAP_RAW}
+ROOM_OPTIONS = sorted(set(v for _, v in ROOM_MAP_RAW))
+ROOM_OPTIONS = ["", *ROOM_OPTIONS, "Other"]
 
 def _infer_room_from_tag(tag_val: str) -> str:
     """
@@ -231,18 +233,18 @@ def _infer_room_from_tag(tag_val: str) -> str:
 def extract_links_by_pages(
     pdf_bytes: bytes,
     page_to_tag: dict[int, str] | None,
+    page_to_room: dict[int, str] | None = None,
     only_listed_pages: bool = True,
     pad_px: float = 4.0,
     band_px: float = 28.0,
 ) -> pd.DataFrame:
     doc = fitz.open("pdf", pdf_bytes)
-    rows = []
-    listed = set(page_to_tag.keys()) if page_to_tag else set()
+    rows = []    listed = set(page_to_tag.keys()) if page_to_tag else set()
 
     for pidx, page in enumerate(doc, start=1):
         if only_listed_pages and page_to_tag and pidx not in listed:
-            continue
-        tag_value = (page_to_tag or {}).get(pidx, "")
+            continue        tag_value = (page_to_tag or {}).get(pidx, "")
+        room_value = (page_to_room or {}).get(pidx, _infer_room_from_tag(tag_value))
 
         for lnk in page.get_links():
             uri = (lnk.get("uri") or "").strip()
@@ -259,8 +261,7 @@ def extract_links_by_pages(
 
             rows.append({
                 "page": pidx,
-                "Tags": tag_value,
-                "Room": _infer_room_from_tag(tag_value),
+                "Tags": tag_value,                "Room": room_value,
                 "Position": position,
                 "Type": fields.get("Type", ""),
                 "QTY": fields.get("QTY", ""),
@@ -574,12 +575,13 @@ with tab1:
             st.error(f"Could not read PDF: {e}")
 
     st.markdown("**Page → Tags table**")
-    default_df = pd.DataFrame([{"page": "", "Tags": ""}])
+    default_df = pd.DataFrame([{"page": "", "Tags": "", "Room": ""}])
     mapping_df = st.data_editor(
         default_df, num_rows="dynamic", use_container_width=True, key="page_tag_editor",
         column_config={
             "page": st.column_config.TextColumn("page", help="Page number (1-based)"),
-            "Tags": st.column_config.TextColumn("Tags", help="Room name for that page"),
+            "Tags": st.column_config.TextColumn("Tags", help="Label from the PDF page (e.g., Pendant, Sink)"),
+            "Room": st.column_config.SelectboxColumn("Room", options=ROOM_OPTIONS, help="Pick a room/category or leave blank to auto-infer from Tags"),
         }
     )
     only_listed = st.checkbox("Only extract pages listed above", value=True)
@@ -593,22 +595,26 @@ with tab1:
             try:
                 num_pages = len(fitz.open("pdf", pdf_file.getvalue()))
             except:
-                num_pages = None
+                num_pages = None        page_to_room = {}
         for _, row in mapping_df.iterrows():
-            p_raw = str(row.get("page","")).strip()
-            t_raw = str(row.get("Tags","")).strip()
+            p_raw = str(row.get("page",""))..strip()
+            t_raw = str(row.get("Tags",""))..strip()
+            r_raw = str(row.get("Room",""))..strip()
             if not p_raw: continue
             try:
                 p_no = int(p_raw)
                 if p_no >= 1 and (num_pages is None or p_no <= num_pages):
                     page_to_tag[p_no] = t_raw
+                    # if room left blank, we'll infer from tag later during extraction
+                    if r_raw:
+                        page_to_room[p_no] = r_raw
             except:
                 continue
 
         pdf_bytes = pdf_file.read()
         with st.spinner("Extracting links, positions & titles…"):
             df = extract_links_by_pages(
-                pdf_bytes, page_to_tag,
+                pdf_bytes, page_to_tag, page_to_room,
                 only_listed_pages=only_listed,
                 pad_px=pad_px,
                 band_px=band_px
