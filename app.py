@@ -252,6 +252,9 @@ def extract_links_by_pages(
             rect = lnk.get("from")
             raw = extract_link_title_strict(page, rect, pad_px=pad_px, band_px=band_px)
             position, title = split_position_and_title_start(raw)
+            # Ignore common headings like "MATERIALS LIST"
+            if not title or title.strip().lower().startswith(("materials list","material list")):
+                continue
             fields = parse_link_title_fields(title)
 
             rows.append({
