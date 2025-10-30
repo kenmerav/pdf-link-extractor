@@ -628,25 +628,30 @@ if run1 and st.session_state.get("pdf_bytes"):
 if st.session_state.get("extracted_df") is not None:
     st.caption("Edit the Room per row if needed, then download your CSV.")
     # Make a safe, string-typed copy to ensure Selectbox works for all choices (incl. "Plumbing")
-df_show = st.session_state["extracted_df"].copy()
-if "Room" not in df_show.columns:
-    df_show["Room"] = ""
-df_show["Room"] = df_show["Room"].astype(str).fillna("").replace({"nan": ""})
+    df_show = st.session_state["extracted_df"].copy()
+    if "Room" not in df_show.columns:
+        df_show["Room"] = ""
+    df_show["Room"] = df_show["Room"].astype(str).fillna("").replace({"nan": ""})
 
-edited_df = st.data_editor(
-    df_show,
+    edited_df = st.data_editor(
+        df_show,
         key="links_editor",
         use_container_width=True,
         column_config={
-            "Room": st.column_config.SelectboxColumn("Room", options=ROOM_OPTIONS, help="Choose a room/category or leave blank")
-        }
+            "Room": st.column_config.SelectboxColumn(
+                "Room",
+                options=ROOM_OPTIONS,
+                help="Choose a room/category or leave blank",
+            )
+        },
     )
     st.session_state["extracted_df"] = edited_df
+
     st.download_button(
         "Download CSV",
         edited_df.to_csv(index=False).encode("utf-8"),
         file_name="canva_links_with_position.csv",
-        mime="text/csv"
+        mime="text/csv",
     )
 
 # --- Tab 2: Enrich CSV (your version preserved) ---
