@@ -573,6 +573,9 @@ with tab1:
             _peek = fitz.open("pdf", pdf_file.getvalue())
             num_pages = len(_peek)
             st.info(f"PDF detected with **{num_pages}** page(s).")
+            # Persist the bytes and page count so buttons are enabled and edits survive reruns
+            st.session_state["pdf_bytes"] = pdf_file.getvalue()
+            st.session_state["num_pages"] = num_pages
         except Exception as e:
             st.error(f"Could not read PDF: {e}")
 
@@ -589,7 +592,7 @@ with tab1:
     pad_px = st.slider("Link capture pad (pixels)", 0, 16, 4, 1)
     band_px = st.slider("Nearby text band (pixels)", 0, 60, 28, 2)
 
-    run1 = st.button("Extract", type="primary", disabled=(st.session_state.get("pdf_bytes") is None), key="extract_btn")
+    run1 = st.button("Extract", type="primary", disabled=(pdf_file is None), key="extract_btn")
 if run1 and st.session_state.get("pdf_bytes"):
     # Build mapping from editor
     page_to_tag = {}
