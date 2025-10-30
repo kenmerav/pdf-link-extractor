@@ -202,8 +202,8 @@ ROOM_MAP_RAW = [
 
 # build a lowercase lookup dict for exact/starts-with style checks
 ROOM_MAP = {k.lower(): v for (k, v) in ROOM_MAP_RAW}
-ROOM_OPTIONS = sorted(set(v for _, v in ROOM_MAP_RAW))
-ROOM_OPTIONS = ["", *ROOM_OPTIONS, "Other"]
+# Explicit options list to avoid any set-order surprises
+ROOM_OPTIONS = ["", "Lighting", "Plumbing", "Other"]
 
 def _infer_room_from_tag(tag_val: str) -> str:
     """
@@ -627,8 +627,14 @@ if run1 and st.session_state.get("pdf_bytes"):
 # Always render editable table if we have data
 if st.session_state.get("extracted_df") is not None:
     st.caption("Edit the Room per row if needed, then download your CSV.")
-    edited_df = st.data_editor(
-        st.session_state["extracted_df"],
+    # Make a safe, string-typed copy to ensure Selectbox works for all choices (incl. "Plumbing")
+df_show = st.session_state["extracted_df"].copy()
+if "Room" not in df_show.columns:
+    df_show["Room"] = ""
+df_show["Room"] = df_show["Room"].astype(str).fillna("").replace({"nan": ""})
+
+edited_df = st.data_editor(
+    df_show,
         key="links_editor",
         use_container_width=True,
         column_config={
