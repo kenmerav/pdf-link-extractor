@@ -581,7 +581,10 @@ with tab1:
     mapping_df = st.data_editor(
         default_df, num_rows="dynamic", use_container_width=True, key="page_tag_editor",
         column_config={
-            "page": st.column_config.TextColumn("page", help="Page number (1-based
+            "page": st.column_config.TextColumn("page", help="Page number (1-based)"),
+            "Tags": st.column_config.TextColumn("Tags", help="Room name for that page"),
+        }
+    )
     only_listed = st.checkbox("Only extract pages listed above", value=True)
     pad_px = st.slider("Link capture pad (pixels)", 0, 16, 4, 1)
     band_px = st.slider("Nearby text band (pixels)", 0, 60, 28, 2)
