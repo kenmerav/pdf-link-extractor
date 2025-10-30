@@ -239,11 +239,13 @@ def extract_links_by_pages(
     band_px: float = 28.0,
 ) -> pd.DataFrame:
     doc = fitz.open("pdf", pdf_bytes)
-    rows = []    listed = set(page_to_tag.keys()) if page_to_tag else set()
+    rows = []
+    listed = set(page_to_tag.keys()) if page_to_tag else set()
 
     for pidx, page in enumerate(doc, start=1):
         if only_listed_pages and page_to_tag and pidx not in listed:
-            continue        tag_value = (page_to_tag or {}).get(pidx, "")
+            continue
+        tag_value = (page_to_tag or {}).get(pidx, "")
         room_value = (page_to_room or {}).get(pidx, _infer_room_from_tag(tag_value))
 
         for lnk in page.get_links():
@@ -595,11 +597,12 @@ with tab1:
             try:
                 num_pages = len(fitz.open("pdf", pdf_file.getvalue()))
             except:
-                num_pages = None        page_to_room = {}
+                num_pages = None
+        page_to_room = {}
         for _, row in mapping_df.iterrows():
-            p_raw = str(row.get("page",""))..strip()
-            t_raw = str(row.get("Tags",""))..strip()
-            r_raw = str(row.get("Room",""))..strip()
+            p_raw = str(row.get("page","")).strip()
+            t_raw = str(row.get("Tags","")).strip()
+            r_raw = str(row.get("Room","")).strip()
             if not p_raw: continue
             try:
                 p_no = int(p_raw)
