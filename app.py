@@ -589,7 +589,8 @@ with tab1:
         }
     )
     only_listed = st.checkbox("Only extract pages listed above", value=True)
-    pad_px = st.slider("Link capture pad (pixels)", 0, 16, 4, 1)    band_px = st.slider("Nearby text band (pixels)", 0, 60, 28, 2)
+    pad_px = st.slider("Link capture pad (pixels)", 0, 16, 4, 1)
+    band_px = st.slider("Nearby text band (pixels)", 0, 60, 28, 2)
     # De-duplication option: removes rows where the same URL is hyperlinked multiple times on the same line (e.g., bullet + text)
     dedupe_on = st.checkbox(
         "Remove duplicate links (same URL + same line)",
@@ -634,9 +635,27 @@ if run1 and st.session_state.get("pdf_bytes"):
                   .drop(columns=["__canon", "__lt", "__len"])
             )
 
-    # Build column configs so only Room is editable; other columns are view-only.$1
+    # Build column configs so only Room is editable; other columns are view-only.
+    col_cfg = {
+        "page": st.column_config.NumberColumn("page", disabled=True),
+        "Tags": st.column_config.TextColumn("Tags", disabled=True),
+        "Room": st.column_config.SelectboxColumn(
+            "Room",
+            options=ROOM_OPTIONS,
+            help="Auto-filled from Tags when possible. You can override here.",
+        ),
+        "Position": st.column_config.TextColumn("Position", disabled=True),
+        "Type": st.column_config.TextColumn("Type", disabled=True),
+        "QTY": st.column_config.TextColumn("QTY", disabled=True),
+        "Finish": st.column_config.TextColumn("Finish", disabled=True),
+        "Size": st.column_config.TextColumn("Size", disabled=True),
+        "link_url": st.column_config.LinkColumn("link_url", disabled=True),
+        "link_text": st.column_config.TextColumn("link_text", disabled=True),
+    }
+
+    # Use last-saved DF if present so your edits persist across reruns
     df_show = st.session_state.get("extracted_df", df.copy())
-$2 so edits only apply when you click Save, avoiding partial rerun glitches
+
     with st.form("room_editor"):
         edited_df = st.data_editor(
             df_show,
