@@ -591,6 +591,12 @@ with tab1:
     only_listed = st.checkbox("Only extract pages listed above", value=True)
     pad_px = st.slider("Link capture pad (pixels)", 0, 16, 4, 1)
     band_px = st.slider("Nearby text band (pixels)", 0, 60, 28, 2)
+# De-duplication option: removes rows where the same URL is hyperlinked multiple times on the same line (e.g., bullet + text)
+dedupe_on = st.checkbox(
+    "Remove duplicate links (same URL + same line)",
+    value=True,
+    help="Keeps just one row when Canva applied the same hyperlink to both the bullet and the text."
+)
 
     run1 = st.button("Extract", type="primary", disabled=(pdf_file is None), key="extract_btn")
 if run1 and st.session_state.get("pdf_bytes"):
@@ -617,24 +623,18 @@ if run1 and st.session_state.get("pdf_bytes"):
             pad_px=pad_px,
             band_px=band_px
         )
-    if df.empty:
-        st.info("No links found. Verify the PDF uses live hyperlinks (not just images).")
-        st.session_state["extracted_df"] = None
-    else:
-        st.session_state["extracted_df"] = df
-        st.success(f"Extracted {len(df)} row(s). You can now edit the Room values below without losing your place.")
-
-# Always render editable table if we have data
-if st.session_state.get("extracted_df") is not None:
-    st.caption("Edit the Room per row if needed, then click **Save room edits**. When you're done, download the CSV.")
-
-    # Make a safe, string-typed copy to ensure Selectbox works for all choices (incl. "Plumbing")
-    df_show = st.session_state["extracted_df"].copy()
-    if "Room" not in df_show.columns:
-        df_show["Room"] = ""
-    df_show["Room"] = (
-        df_show["Room"].astype(str).fillna("").replace({"nan": ""})
-    )
+        # Optional: collapse duplicates caused by Canva linking both the bullet and the line text
+        if dedupe_on and not df.empty:
+            df["__canon"] = df["link_url"].map(canonicalize_url)
+            df["__lt"] = df["link_text"].astype(str).str.strip().str.lower()
+            df["__len"] = df["link_text"].astype(str).str.len()
+            # Prefer the row with the longest captured text, then drop dups by (page, canon URL, normalized line text)
+            df = (
+                df.sort_values("__len", ascending=False)
+                  .drop_duplicates(subset=["page", "__canon", "__lt"], keep="first")
+                  .drop(columns=["__canon", "__lt", "__len"])
+            )
+        )
 
     # Build column configs so only Room is editable; other columns are view-only.
     col_cfg = {
