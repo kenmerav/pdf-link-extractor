@@ -589,14 +589,13 @@ with tab1:
         }
     )
     only_listed = st.checkbox("Only extract pages listed above", value=True)
-    pad_px = st.slider("Link capture pad (pixels)", 0, 16, 4, 1)
-    band_px = st.slider("Nearby text band (pixels)", 0, 60, 28, 2)
-# De-duplication option: removes rows where the same URL is hyperlinked multiple times on the same line (e.g., bullet + text)
-dedupe_on = st.checkbox(
-    "Remove duplicate links (same URL + same line)",
-    value=True,
-    help="Keeps just one row when Canva applied the same hyperlink to both the bullet and the text."
-)
+    pad_px = st.slider("Link capture pad (pixels)", 0, 16, 4, 1)    band_px = st.slider("Nearby text band (pixels)", 0, 60, 28, 2)
+    # De-duplication option: removes rows where the same URL is hyperlinked multiple times on the same line (e.g., bullet + text)
+    dedupe_on = st.checkbox(
+        "Remove duplicate links (same URL + same line)",
+        value=True,
+        help="Keeps just one row when Canva applied the same hyperlink to both the bullet and the text."
+    )
 
     run1 = st.button("Extract", type="primary", disabled=(pdf_file is None), key="extract_btn")
 if run1 and st.session_state.get("pdf_bytes"):
@@ -634,27 +633,10 @@ if run1 and st.session_state.get("pdf_bytes"):
                   .drop_duplicates(subset=["page", "__canon", "__lt"], keep="first")
                   .drop(columns=["__canon", "__lt", "__len"])
             )
-        )
 
-    # Build column configs so only Room is editable; other columns are view-only.
-    col_cfg = {
-        "Room": st.column_config.SelectboxColumn(
-            "Room",
-            options=ROOM_OPTIONS,
-            help="Choose a room/category or leave blank",
-        ),
-        "page": st.column_config.TextColumn("page", disabled=True),
-        "Tags": st.column_config.TextColumn("Tags", disabled=True),
-        "Position": st.column_config.TextColumn("Position", disabled=True),
-        "Type": st.column_config.TextColumn("Type", disabled=True),
-        "QTY": st.column_config.TextColumn("QTY", disabled=True),
-        "Finish": st.column_config.TextColumn("Finish", disabled=True),
-        "Size": st.column_config.TextColumn("Size", disabled=True),
-        "link_url": st.column_config.TextColumn("link_url", disabled=True),
-        "link_text": st.column_config.TextColumn("link_text", disabled=True),
-    }
-
-    # Use a form so edits only apply when you click Save, avoiding partial rerun glitches
+    # Build column configs so only Room is editable; other columns are view-only.$1
+    df_show = st.session_state.get("extracted_df", df.copy())
+$2 so edits only apply when you click Save, avoiding partial rerun glitches
     with st.form("room_editor"):
         edited_df = st.data_editor(
             df_show,
@@ -669,15 +651,14 @@ if run1 and st.session_state.get("pdf_bytes"):
     if saved:
         # Persist only when you click Save
         st.session_state["extracted_df"] = edited_df
-        st.success("Room edits saved.")
-
-    # Always show the latest saved data for download
-    st.download_button(
-        "Download CSV",
-        st.session_state["extracted_df"].to_csv(index=False).encode("utf-8"),
-        file_name="canva_links_with_position.csv",
-        mime="text/csv",
-    )
+        st.success("Room edits saved.")    # Download latest saved data if available
+    if "extracted_df" in st.session_state and not st.session_state["extracted_df"].empty:
+        st.download_button(
+            "Download CSV",
+            st.session_state["extracted_df"].to_csv(index=False).encode("utf-8"),
+            file_name="canva_links_with_position.csv",
+            mime="text/csv",
+        )
 
 # --- Tab 2: Enrich CSV (your version preserved) ---
 with tab2:
