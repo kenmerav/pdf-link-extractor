@@ -1,5 +1,5 @@
 import os, io, re, json, time, requests
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 import streamlit as st
 import fitz  # PyMuPDF
 import pandas as pd
@@ -9,6 +9,15 @@ from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode
 # ----------------- Streamlit setup -----------------
 st.set_page_config(page_title="Spec Link Extractor & Enricher", layout="wide")
 st.title("🧰 Spec Link Extractor & Enricher")
+
+# --- Persisted defaults to avoid rerun headaches ---
+for k, v in {
+    "pdf_bytes": None,
+    "num_pages": None,
+    "extracted_df": None,
+    "pending_extract": False,  # gate extraction so Save doesn't re-extract
+}.items():
+    st.session_state.setdefault(k, v)
 
 # --- Progress timer helper ---
 class Timer:
@@ -62,8 +71,8 @@ def _normalize_separators(s: str) -> str:
     s = re.sub(r"\s{2,}", " ", s)
     return s.strip()
 
-def parse_link_title_fields(link_text: str) -> dict:
-    fields = {"Type": "", "QTY": "", "Finish": "", "Size": ""}
+def parse_link_title_fields(link_text: str) -> Dict[str, str]:
+    fields: Dict[str, str] = {"Type": "", "QTY": "", "Finish": "", "Size": ""}
     s = _normalize_separators(link_text)
     if not s:
         return fields
@@ -147,11 +156,9 @@ def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 
     if kept:
         # Expand to the full (block,line) of the kept word(s). Prefer the line with the most words.
         line_keys = [(b, ln) for *_ignore, b, ln in kept]
-        # Count words per line
         counts = {}
         for key in line_keys:
             counts[key] = counts.get(key, 0) + 1
-        # Pick the most represented (block,line)
         best_key = max(counts.items(), key=lambda kv: kv[1])[0]
         bx, lx = best_key
         line_words = [(y0, x0, w) for x0, y0, x1, y1, w, b, ln, *_ in words if b == bx and ln == lx and w]
@@ -161,7 +168,6 @@ def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 
         text = ""
 
     if not text:
-        # last resort: whatever the textbox returns
         try:
             text = (page.get_textbox(R) or "").strip()
         except Exception:
@@ -169,7 +175,7 @@ def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 
 
     return _normalize_separators(text)
 
-def split_position_and_title_start(raw: str) -> tuple[str, str]:
+def split_position_and_title_start(raw: str) -> Tuple[str, str]:
     s = (raw or "").strip()
     if not s:
         return "", ""
@@ -200,30 +206,19 @@ ROOM_MAP_RAW = [
     ("Lamp", "Lighting"),
 ]
 
-# build a lowercase lookup dict for exact/starts-with style checks
-ROOM_MAP = {k.lower(): v for (k, v) in ROOM_MAP_RAW}
-# Explicit options list to avoid any set-order surprises
+ROOM_MAP: Dict[str, str] = {k.lower(): v for (k, v) in ROOM_MAP_RAW}
 ROOM_OPTIONS = ["", "Lighting", "Plumbing", "Other"]
 
 def _infer_room_from_tag(tag_val: str) -> str:
     """
-    Given a 'Tags' value from the page (ex: "Sink" / "Pendant" / etc.),
-    return the mapped Room ("Plumbing", "Lighting", ...).
-
-    Strategy:
-    1. exact lowercase match
-    2. startswith match (so "Sink Faucet" still hits "Sink Faucet" first, then "Sink")
-    Fallback: "" (blank)
+    Given a 'Tags' value from the page (ex: "Sink" / "Pendant" / etc.), return the mapped Room.
+    Strategy: exact lowercase match, then longest prefix match. Fallback: "" (blank)
     """
     if not tag_val:
         return ""
     t = tag_val.strip().lower()
-
-    # exact
     if t in ROOM_MAP:
         return ROOM_MAP[t]
-
-    # try longest key that is prefix of t
     best_key = ""
     for k in ROOM_MAP.keys():
         if t.startswith(k) and len(k) > len(best_key):
@@ -232,8 +227,8 @@ def _infer_room_from_tag(tag_val: str) -> str:
 
 def extract_links_by_pages(
     pdf_bytes: bytes,
-    page_to_tag: dict[int, str] | None,
-    page_to_room: dict[int, str] | None = None,
+    page_to_tag: Optional[Dict[int, str]],
+    page_to_room: Optional[Dict[int, str]] = None,
     only_listed_pages: bool = True,
     pad_px: float = 4.0,
     band_px: float = 28.0,
@@ -257,13 +252,14 @@ def extract_links_by_pages(
             raw = extract_link_title_strict(page, rect, pad_px=pad_px, band_px=band_px)
             position, title = split_position_and_title_start(raw)
             # Ignore common headings like "MATERIALS LIST"
-            if not title or title.strip().lower().startswith(("materials list","material list")):
+            if not title or title.strip().lower().startswith(("materials list", "material list")):
                 continue
             fields = parse_link_title_fields(title)
 
             rows.append({
                 "page": pidx,
-                "Tags": tag_value,                "Room": room_value,
+                "Tags": tag_value,
+                "Room": room_value,
                 "Position": position,
                 "Type": fields.get("Type", ""),
                 "QTY": fields.get("QTY", ""),
@@ -563,19 +559,22 @@ tab1, tab2, tab3 = st.tabs([
     "3) Test single URL"
 ])
 
+# Helper for the Extract button
+def _start_extract():
+    st.session_state["pending_extract"] = True
+
 # --- Tab 1: Canva PDF → rows ---
 with tab1:
     st.caption("Build a page→Tags table, then extract ALL web links on those pages. Each link stays on its own row.")
     pdf_file = st.file_uploader("Upload PDF", type="pdf", key="pdf_extractor")
-    num_pages = None
+
+    # Cache PDF bytes + page count as soon as the user uploads
     if pdf_file:
         try:
             _peek = fitz.open("pdf", pdf_file.getvalue())
-            num_pages = len(_peek)
-            st.info(f"PDF detected with **{num_pages}** page(s).")
-            # Persist the bytes and page count so buttons are enabled and edits survive reruns
             st.session_state["pdf_bytes"] = pdf_file.getvalue()
-            st.session_state["num_pages"] = num_pages
+            st.session_state["num_pages"] = len(_peek)
+            st.info(f"PDF detected with **{st.session_state['num_pages']}** page(s).")
         except Exception as e:
             st.error(f"Could not read PDF: {e}")
 
@@ -591,93 +590,95 @@ with tab1:
     only_listed = st.checkbox("Only extract pages listed above", value=True)
     pad_px = st.slider("Link capture pad (pixels)", 0, 16, 4, 1)
     band_px = st.slider("Nearby text band (pixels)", 0, 60, 28, 2)
-    # De-duplication option: removes rows where the same URL is hyperlinked multiple times on the same line (e.g., bullet + text)
-    dedupe_on = st.checkbox(
-        "Remove duplicate links (same URL + same line)",
-        value=True,
-        help="Keeps just one row when Canva applied the same hyperlink to both the bullet and the text."
+
+    st.button(
+        "Extract",
+        type="primary",
+        key="extract_btn",
+        disabled=(st.session_state.get("pdf_bytes") is None),
+        on_click=_start_extract,
     )
 
-    run1 = st.button("Extract", type="primary", disabled=(pdf_file is None), key="extract_btn")
-if run1 and st.session_state.get("pdf_bytes"):
+# Perform extraction after the UI is declared so button clicks set the flag first
+if st.session_state.get("pending_extract") and st.session_state.get("pdf_bytes") is not None:
     # Build mapping from editor
-    page_to_tag = {}
+    page_to_tag: Dict[int, str] = {}
     num_pages = st.session_state.get("num_pages")
-    for _, row in mapping_df.iterrows():
-        p_raw = str(row.get("page", "")).strip()
-        t_raw = str(row.get("Tags", "")).strip()
-        if not p_raw:
-            continue
-        try:
-            p_no = int(p_raw)
-            if p_no >= 1 and (num_pages is None or p_no <= num_pages):
-                page_to_tag[p_no] = t_raw
-        except Exception:
-            continue
+    try:
+        # mapping_df is defined in the same script run; guard if not
+        for _, row in mapping_df.iterrows():
+            p_raw = str(row.get("page", "")).strip()
+            t_raw = str(row.get("Tags", "")).strip()
+            if not p_raw:
+                continue
+            try:
+                p_no = int(p_raw)
+                if p_no >= 1 and (num_pages is None or p_no <= num_pages):
+                    page_to_tag[p_no] = t_raw
+            except Exception:
+                continue
+    except NameError:
+        # If mapping_df isn't in scope (rare), just extract all pages without tags
+        page_to_tag = {}
 
-    pdf_bytes = st.session_state["pdf_bytes"]
     with st.spinner("Extracting links, positions & titles…"):
         df = extract_links_by_pages(
-            pdf_bytes, page_to_tag, None,
+            st.session_state["pdf_bytes"], page_to_tag, None,
             only_listed_pages=only_listed,
             pad_px=pad_px,
             band_px=band_px
         )
-        # Optional: collapse duplicates caused by Canva linking both the bullet and the line text
-        if dedupe_on and not df.empty:
-            df["__canon"] = df["link_url"].map(canonicalize_url)
-            df["__lt"] = df["link_text"].astype(str).str.strip().str.lower()
-            df["__len"] = df["link_text"].astype(str).str.len()
-            # Prefer the row with the longest captured text, then drop dups by (page, canon URL, normalized line text)
-            df = (
-                df.sort_values("__len", ascending=False)
-                  .drop_duplicates(subset=["page", "__canon", "__lt"], keep="first")
-                  .drop(columns=["__canon", "__lt", "__len"])
-            )
+    st.session_state["extracted_df"] = df if not df.empty else None
+    st.session_state["pending_extract"] = False
 
-    # Build column configs so only Room is editable; other columns are view-only.
+# Always render editable table if we have data
+if st.session_state.get("extracted_df") is not None:
+    st.caption("Edit the Room per row if needed, then click **Save room edits**. When you're done, download the CSV.")
+
+    df_show = st.session_state["extracted_df"].copy()
+    if "Room" not in df_show.columns:
+        df_show["Room"] = ""
+    df_show["Room"] = df_show["Room"].astype(str).fillna("").replace({"nan": ""})
+
     col_cfg = {
-        "page": st.column_config.NumberColumn("page", disabled=True),
-        "Tags": st.column_config.TextColumn("Tags", disabled=True),
         "Room": st.column_config.SelectboxColumn(
             "Room",
             options=ROOM_OPTIONS,
-            help="Auto-filled from Tags when possible. You can override here.",
+            help="Choose a room/category or leave blank",
         ),
+        "page": st.column_config.TextColumn("page", disabled=True),
+        "Tags": st.column_config.TextColumn("Tags", disabled=True),
         "Position": st.column_config.TextColumn("Position", disabled=True),
         "Type": st.column_config.TextColumn("Type", disabled=True),
         "QTY": st.column_config.TextColumn("QTY", disabled=True),
         "Finish": st.column_config.TextColumn("Finish", disabled=True),
         "Size": st.column_config.TextColumn("Size", disabled=True),
-        "link_url": st.column_config.LinkColumn("link_url", disabled=True),
+        "link_url": st.column_config.TextColumn("link_url", disabled=True),
         "link_text": st.column_config.TextColumn("link_text", disabled=True),
     }
 
-    # Use last-saved DF if present so your edits persist across reruns
-    df_show = st.session_state.get("extracted_df", df.copy())
-
+    # Edits apply only when you click Save — avoids partial reruns breaking choices
     with st.form("room_editor"):
         edited_df = st.data_editor(
             df_show,
             key="links_editor",
             use_container_width=True,
             hide_index=True,
-            num_rows="fixed",  # lock row count to prevent accidental adds/deletes
+            num_rows="fixed",
             column_config=col_cfg,
         )
         saved = st.form_submit_button("Save room edits", type="primary")
 
     if saved:
-        # Persist only when you click Save
         st.session_state["extracted_df"] = edited_df
-        st.success("Room edits saved.")    # Download latest saved data if available
-    if "extracted_df" in st.session_state and not st.session_state["extracted_df"].empty:
-        st.download_button(
-            "Download CSV",
-            st.session_state["extracted_df"].to_csv(index=False).encode("utf-8"),
-            file_name="canva_links_with_position.csv",
-            mime="text/csv",
-        )
+        st.success("Room edits saved.")
+
+    st.download_button(
+        "Download CSV",
+        st.session_state["extracted_df"].to_csv(index=False).encode("utf-8"),
+        file_name="canva_links_with_position.csv",
+        mime="text/csv",
+    )
 
 # --- Tab 2: Enrich CSV (your version preserved) ---
 with tab2:
@@ -824,4 +825,3 @@ with tab3:
         st.write("**Price:**", price or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
-
