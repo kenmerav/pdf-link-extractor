@@ -1,5 +1,5 @@
 import os, io, re, json, time, requests
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Iterable
 import streamlit as st
 import fitz  # PyMuPDF
 import pandas as pd
@@ -30,6 +30,31 @@ class Timer:
 # ========================= Shared HTTP/parsing helpers =========================
 PRICE_RE = re.compile(r"\$\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?")
 UA = {"User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
+
+# --- Safe scalar helper to avoid list/dict values leaking into DataFrame columns ---
+def _first_scalar(v):
+    """Return a single string from possibly-list/dict values (e.g., meta['image'])."""
+    if v is None:
+        return ""
+    # If list/tuple/set, pick the first non-empty str; else stringify first element
+    if isinstance(v, (list, tuple, set)):
+        for x in v:
+            if isinstance(x, str) and x.strip():
+                return x.strip()
+        try:
+            first = next(iter(v))
+            return str(first)
+        except StopIteration:
+            return ""
+    # If dict, try common keys
+    if isinstance(v, dict):
+        for k in ("url", "src", "image", "content", "@id"):
+            vv = v.get(k)
+            if isinstance(vv, str) and vv.strip():
+                return vv.strip()
+        return str(v)
+    # If already a string or something else
+    return v if isinstance(v, str) else str(v)
 
 def requests_get(url: str, timeout: int = 20, retries: int = 2) -> Optional[requests.Response]:
     for _ in range(retries+1):
@@ -477,13 +502,16 @@ def firecrawl_scrape_v2(url: str, api_key: str, mode: str = "simple") -> dict:
         return {}
 
 def parse_image_and_price_from_v2_generic(scrape: dict) -> Tuple[str, str]:
-    """Generic Firecrawl parse: OG/Twitter/meta + JSON-LD + visible."""
+    """Generic Firecrawl parse: OG/Twitter/meta + JSON-LD + visible.
+    Ensures scalar strings are returned (not lists/dicts) to keep DataFrame columns homogenous.
+    """
     if not scrape: return "", ""
     data = scrape.get("data") or {}
     meta = data.get("metadata") or {}
     html = data.get("html") or ""
 
     img = meta.get("og:image") or meta.get("twitter:image") or meta.get("image") or ""
+    img = _first_scalar(img)
     price = ""
     if html:
         soup = BeautifulSoup(html or "", "lxml")
@@ -507,7 +535,7 @@ def parse_image_and_price_from_v2_generic(scrape: dict) -> Tuple[str, str]:
         if not price:
             m = PRICE_RE.search(soup.get_text(" ", strip=True))
             if m: price = m.group(0)
-    return img or "", price or ""
+    return _first_scalar(img) or "", _first_scalar(price) or ""
 
 def enrich_domain_firecrawl_v2(url: str, api_key: str) -> Tuple[str, str, str]:
     sc = firecrawl_scrape_v2(url, api_key, mode="simple")
@@ -780,11 +808,20 @@ with tab2:
             if st.button("Enrich (Image URL + Price)", key="enrich_btn"):
                 with st.spinner("Scraping image + price..."):
                     df_out = enrich_urls(df_in, url_col, api_key_input)
+                # Coerce problematic columns to plain strings to avoid Arrow list/non-list issues
+                for c in ["scraped_image_url", "price", "scrape_status"]:
+                    if c in df_out.columns:
+                        df_out[c] = df_out[c].apply(_first_scalar).astype(str).fillna("")
                 st.success("Enriched! ✅")
                 st.dataframe(df_out, use_container_width=True)
                 st.caption(df_out["scrape_status"].value_counts(dropna=False).to_frame("count"))
                 out_csv = df_out.to_csv(index=False).encode("utf-8")
                 st.download_button(
+                    "Download enriched CSV",
+                    data=out_csv,
+                    file_name="links_enriched.csv",
+                    mime="text/csv",
+                )
                     "Download enriched CSV",
                     data=out_csv,
                     file_name="links_enriched.csv",
