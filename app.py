@@ -16,6 +16,11 @@ for k, v in {
     "num_pages": None,
     "extracted_df": None,
     "pending_extract": False,  # gate extraction so Save doesn't re-extract
+    # --- Skip/auto-skip controls for enrichment ---
+    "skip_urls": [],                 # list[str] of URLs to skip
+    "fail_counts": {},              # dict[url->int] failure counts
+    "enable_auto_skip": True,       # auto add to skip after N fails
+    "auto_skip_after_n": 2,         # N failures before auto-skip
 }.items():
     st.session_state.setdefault(k, v)
 
@@ -748,9 +753,18 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str], *, max_p
 
     t0 = time.perf_counter()
     for k, i in enumerate(window, start=1):
+        # --- Skip list + auto-skip settings ---
+        skip_set = set(st.session_state.get("skip_urls", []))
+        enable_auto = bool(st.session_state.get("enable_auto_skip", True))
+        auto_n = int(st.session_state.get("auto_skip_after_n", 2))
         u = urls[i].strip()
         if not u:
             imgs[i] = ""; prices[i] = ""; titles[i] = ""; status[i] = (status[i] + "+no_url") if status[i] else "no_url"
+            prog.progress(k/len(window));
+            continue
+        # If this URL is manually skipped, mark and move on
+        if u in skip_set:
+            status[i] = (status[i] + "+skipped") if status[i] else "skipped"
             prog.progress(k/len(window));
             continue
 
@@ -778,6 +792,15 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str], *, max_p
                     st_code = (st_code + "+fetch_failed") if st_code else "fetch_failed"
         except Exception as e:
             st_code = (st_code + "+error") if st_code else "error"
+
+        # --- Track failures and auto-skip if needed on future passes ---
+        if ("fetch_failed" in st_code) or ("error" in st_code):
+            fc = st.session_state.get("fail_counts", {})
+            fc[u] = int(fc.get(u, 0)) + 1
+            st.session_state["fail_counts"] = fc
+            if enable_auto and fc[u] >= auto_n and u not in st.session_state.get("skip_urls", []):
+                st.session_state["skip_urls"].append(u)
+                st.toast(f"Auto-skipped after {fc[u]} failures: {u}", icon="⏭️")
 
         # Force scalars (strings)
         imgs[i] = _first_scalar(img) or ""
@@ -807,7 +830,11 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str], *, max_p
 
     # Write back arrays to the DataFrame (strings only)
     out["scraped_image_url"], out["price"], out["scrape_status"], out["product_title"] = imgs, prices, status, titles
-    return out
+
+# Persist updated skip/failure state
+st.session_state["skip_urls"] = st.session_state.get("skip_urls", [])
+st.session_state["fail_counts"] = st.session_state.get("fail_counts", {})
+return out
 
 # ----------------- Sidebar (API key) -----------------
 
@@ -968,8 +995,28 @@ with tab2:
             # New: chunk & resume controls
             c1, c2, c3 = st.columns([1,1,1])
             max_per_run = c1.number_input("Max per run", min_value=1, max_value=2000, value=100, step=50, help="Process at most this many pending rows on this click.")
-            start_at   = c2.number_input("Skip first N pending", min_value=0, max_value=100000, value=0, step=10, help="Useful to manually resume if needed.")
-            autosave_every = c3.number_input("Autosave every N", min_value=5, max_value=500, value=25, step=5, help="Saves a partial CSV in session_state so you never lose progress.")
+start_at   = c2.number_input("Skip first N pending", min_value=0, max_value=100000, value=0, step=10, help="Useful to manually resume if needed.")
+autosave_every = c3.number_input("Autosave every N", min_value=5, max_value=500, value=25, step=5, help="Saves a partial CSV in session_state so you never lose progress.")
+
+# --- Skip problematic URLs controls ---
+with st.expander("Skip problematic URLs", expanded=False):
+    current_skip = "
+".join(st.session_state.get("skip_urls", []))
+    new_skip_text = st.text_area("One URL per line (these will be skipped without fetching)", value=current_skip, height=120)
+    st.session_state["skip_urls"] = [u.strip() for u in new_skip_text.splitlines() if u.strip()]
+    cc1, cc2 = st.columns(2)
+    st.session_state["enable_auto_skip"] = cc1.checkbox("Auto-skip after N failures", value=st.session_state.get("enable_auto_skip", True))
+    st.session_state["auto_skip_after_n"] = int(cc2.number_input("N failures", min_value=1, max_value=10, value=int(st.session_state.get("auto_skip_after_n", 2)), step=1))
+    if st.session_state.get("skip_urls"):
+        st.caption(f"{len(st.session_state['skip_urls'])} URL(s) in skip list.")
+        st.download_button(
+            "Download skip list",
+            data=("
+".join(st.session_state["skip_urls"]).encode("utf-8")),
+            file_name="skip_urls.txt",
+            mime="text/plain",
+            key="skip_download_btn",
+        )
 
             if st.button("Enrich (Image URL + Price + Title)", key="enrich_btn"):
                 with st.spinner("Scraping image + price + title..."):
