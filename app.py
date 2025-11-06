@@ -831,10 +831,10 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str], *, max_p
     # Write back arrays to the DataFrame (strings only)
     out["scraped_image_url"], out["price"], out["scrape_status"], out["product_title"] = imgs, prices, status, titles
 
-# Persist updated skip/failure state
-st.session_state["skip_urls"] = st.session_state.get("skip_urls", [])
-st.session_state["fail_counts"] = st.session_state.get("fail_counts", {})
-return out
+    # Persist updated skip/failure state
+    st.session_state["skip_urls"] = st.session_state.get("skip_urls", [])
+    st.session_state["fail_counts"] = st.session_state.get("fail_counts", {})
+    return out
 
 # ----------------- Sidebar (API key) -----------------
 
@@ -992,35 +992,59 @@ with tab2:
             url_col_guess = "Product URL" if "Product URL" in df_in.columns else df_in.columns[min(1, len(df_in)-1)]
             url_col = st.text_input("URL column name", url_col_guess)
 
-            # New: chunk & resume controls
-            c1, c2, c3 = st.columns([1,1,1])
-            max_per_run = c1.number_input("Max per run", min_value=1, max_value=2000, value=100, step=50, help="Process at most this many pending rows on this click.")
-start_at   = c2.number_input("Skip first N pending", min_value=0, max_value=100000, value=0, step=10, help="Useful to manually resume if needed.")
-autosave_every = c3.number_input("Autosave every N", min_value=5, max_value=500, value=25, step=5, help="Saves a partial CSV in session_state so you never lose progress.")
+            # Chunk & resume controls
+            c1, c2, c3 = st.columns([1, 1, 1])
+            with c1:
+                max_per_run = st.number_input(
+                    "Max per run", min_value=1, max_value=2000, value=100, step=50,
+                    help="Process at most this many pending rows on this click."
+                )
+            with c2:
+                start_at = st.number_input(
+                    "Skip first N pending", min_value=0, max_value=100000, value=0, step=10,
+                    help="Useful to manually resume if needed."
+                )
+            with c3:
+                autosave_every = st.number_input(
+                    "Autosave every N", min_value=5, max_value=500, value=25, step=5,
+                    help="Saves a partial CSV in session_state so you never lose progress."
+                )
 
-# --- Skip problematic URLs controls ---
-with st.expander("Skip problematic URLs", expanded=False):
-    current_skip = "
+            # --- Skip problematic URLs controls ---
+            with st.expander("Skip problematic URLs", expanded=False):
+                current_skip = "
 ".join(st.session_state.get("skip_urls", []))
-    new_skip_text = st.text_area("One URL per line (these will be skipped without fetching)", value=current_skip, height=120)
-    st.session_state["skip_urls"] = [u.strip() for u in new_skip_text.splitlines() if u.strip()]
-    cc1, cc2 = st.columns(2)
-    st.session_state["enable_auto_skip"] = cc1.checkbox("Auto-skip after N failures", value=st.session_state.get("enable_auto_skip", True))
-    st.session_state["auto_skip_after_n"] = int(cc2.number_input("N failures", min_value=1, max_value=10, value=int(st.session_state.get("auto_skip_after_n", 2)), step=1))
-    if st.session_state.get("skip_urls"):
-        st.caption(f"{len(st.session_state['skip_urls'])} URL(s) in skip list.")
-        st.download_button(
-            "Download skip list",
-            data=("
+                new_skip_text = st.text_area(
+                    "One URL per line (these will be skipped without fetching)",
+                    value=current_skip, height=120
+                )
+                st.session_state["skip_urls"] = [u.strip() for u in new_skip_text.splitlines() if u.strip()]
+                cc1, cc2 = st.columns(2)
+                st.session_state["enable_auto_skip"] = cc1.checkbox(
+                    "Auto-skip after N failures",
+                    value=st.session_state.get("enable_auto_skip", True)
+                )
+                st.session_state["auto_skip_after_n"] = int(cc2.number_input(
+                    "N failures", min_value=1, max_value=10,
+                    value=int(st.session_state.get("auto_skip_after_n", 2)), step=1
+                ))
+                if st.session_state.get("skip_urls"):
+                    st.caption(f"{len(st.session_state['skip_urls'])} URL(s) in skip list.")
+                    st.download_button(
+                        "Download skip list",
+                        data=("
 ".join(st.session_state["skip_urls"]).encode("utf-8")),
-            file_name="skip_urls.txt",
-            mime="text/plain",
-            key="skip_download_btn",
-        )
+                        file_name="skip_urls.txt",
+                        mime="text/plain",
+                        key="skip_download_btn",
+                    )
 
             if st.button("Enrich (Image URL + Price + Title)", key="enrich_btn"):
                 with st.spinner("Scraping image + price + title..."):
-                    df_out = enrich_urls(df_in, url_col, api_key_input, max_per_run=max_per_run, start_at=start_at, autosave_every=autosave_every)
+                    df_out = enrich_urls(
+                        df_in, url_col, api_key_input,
+                        max_per_run=int(max_per_run), start_at=int(start_at), autosave_every=int(autosave_every)
+                    )
                 st.success("Enriched! ✅")
                 st.dataframe(df_out, use_container_width=True)
 
