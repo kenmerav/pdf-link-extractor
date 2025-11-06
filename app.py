@@ -698,7 +698,119 @@ def enrich_lumens_v2(url: str, api_key: str) -> Tuple[str, str, str, str]:
         status = "firecrawl_v2_gentle" if (i2 or p2 or t2) else status
     return img, price, title, status
 
+# ----------------- Bulk Enrichment (chunked + resume) -----------------
+
+def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str], *, max_per_run: int = 100, start_at: int = 0, autosave_every: int = 25) -> pd.DataFrame:
+    """Enrich a links CSV in chunks with resume + autosave.
+    Ensures all output columns are homogenous strings (no lists/dicts) to avoid Arrow errors.
+    """
+    out = df.copy()
+
+    # Pick URL column safely
+    if url_col not in out.columns:
+        if len(out.columns) >= 2:
+            url_col = out.columns[1]
+        else:
+            st.error(f"URL column '{url_col}' not found.")
+            return out
+
+    # Ensure output columns exist and are string-typed
+    for col in ("scraped_image_url", "price", "scrape_status", "product_title"):
+        if col not in out.columns:
+            out[col] = ""
+        out[col] = out[col].astype(str).fillna("")
+
+    urls = out[url_col].astype(str).fillna("").tolist()
+    imgs   = out["scraped_image_url"].astype(str).fillna("").tolist()
+    prices = out["price"].astype(str).fillna("").tolist()
+    status = out["scrape_status"].astype(str).fillna("").tolist()
+    titles = out["product_title"].astype(str).fillna("").tolist()
+
+    # Done = has image AND price AND title
+    done = [bool(imgs[i]) and bool(prices[i]) and bool(titles[i]) for i in range(len(urls))]
+    pending_idxs = [i for i, ok in enumerate(done) if not ok]
+
+    if not pending_idxs:
+        st.info("Nothing to do — all rows already enriched.")
+        return out
+
+    # Apply resume window
+    start_at = max(0, int(start_at))
+    max_per_run = max(1, int(max_per_run))
+    window = pending_idxs[start_at : start_at + max_per_run]
+    if not window:
+        st.info("No pending rows in the selected window (adjust 'Skip first N pending').")
+        return out
+
+    api_key = (api_key or "").strip()
+    prog = st.progress(0)
+    hb = st.empty()
+
+    t0 = time.perf_counter()
+    for k, i in enumerate(window, start=1):
+        u = urls[i].strip()
+        if not u:
+            imgs[i] = ""; prices[i] = ""; titles[i] = ""; status[i] = (status[i] + "+no_url") if status[i] else "no_url"
+            prog.progress(k/len(window));
+            continue
+
+        img = price = title = ""; st_code = ""
+        try:
+            if api_key:
+                if "lumens.com" in u:
+                    img, price, title, st_code = enrich_lumens_v2(u, api_key)
+                elif "fergusonhome.com" in u:
+                    img, price, title, st_code = enrich_ferguson_v2(u, api_key)
+                elif "wayfair.com" in u:
+                    img, price, title, st_code = enrich_wayfair_v2(u, api_key)
+                else:
+                    img, price, title, st_code = enrich_domain_firecrawl_v2(u, api_key)
+
+            if not img or not price or not title:
+                r = requests_get(u)
+                if r and r.text:
+                    i2, p2, t2 = pick_image_and_price_bs4(r.text, u)
+                    img = img or _first_scalar(i2)
+                    price = price or _first_scalar(p2)
+                    title = title or normalize_product_title(_first_scalar(t2), u)
+                    st_code = (st_code + "+bs4_ok") if st_code else "bs4_ok"
+                else:
+                    st_code = (st_code + "+fetch_failed") if st_code else "fetch_failed"
+        except Exception as e:
+            st_code = (st_code + "+error") if st_code else "error"
+
+        # Force scalars (strings)
+        imgs[i] = _first_scalar(img) or ""
+        prices[i] = _first_scalar(price) or ""
+        titles[i] = _first_scalar(title) or ""
+        status[i] = _first_scalar(st_code) or ""
+
+        # Heartbeat + ETA
+        elapsed = time.perf_counter() - t0
+        rate = elapsed / max(1, k)
+        remaining = (len(window) - k) * rate
+        hb.write(f"Processed {k}/{len(window)} • last URL: {u[:80]} • ETA ~{int(remaining)}s")
+        prog.progress(k/len(window))
+
+        # Autosave
+        if autosave_every and (k % autosave_every == 0):
+            tmp = out.copy()
+            tmp["scraped_image_url"] = imgs
+            tmp["price"] = prices
+            tmp["scrape_status"] = status
+            tmp["product_title"] = titles
+            st.session_state["last_partial_csv"] = tmp.to_csv(index=False).encode("utf-8")
+            st.toast("Autosaved partial CSV", icon="💾")
+
+        # gentle spacing for UI
+        time.sleep(0.05)
+
+    # Write back arrays to the DataFrame (strings only)
+    out["scraped_image_url"], out["price"], out["scrape_status"], out["product_title"] = imgs, prices, status, titles
+    return out
+
 # ----------------- Sidebar (API key) -----------------
+
 with st.sidebar:
     st.subheader("Firecrawl (optional)")
     api_key_input = st.text_input(
