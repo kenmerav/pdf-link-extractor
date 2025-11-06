@@ -633,7 +633,7 @@ def enrich_domain_firecrawl_v2(url: str, api_key: str) -> Tuple[str, str, str, s
         i2, p2, t2 = parse_image_and_price_from_v2_generic(sc2)
         img = img or i2
         price = price or p2
-        title = title or t2
+        title = title or normalize_product_title(t2, u)
         status = "firecrawl_v2_gentle" if (i2 or p2 or t2) else status
     return img, price, title, status
 
@@ -653,7 +653,7 @@ def enrich_lumens_v2(url: str, api_key: str) -> Tuple[str, str, str, str]:
         i2, p2, t2 = parse_image_and_price_lumens_from_v2(sc2)
         img = img or i2
         price = price or p2
-        title = title or t2
+        title = title or normalize_product_title(t2, u)
         status = "firecrawl_v2_gentle" if (i2 or p2 or t2) else status
     return img, price, title, status
 
@@ -866,7 +866,7 @@ with tab2:
                                 i2, p2, t2 = pick_image_and_price_bs4(r.text, u)
                                 img = img or i2
                                 price = price or p2
-                                title = title or t2
+                                title = title or normalize_product_title(t2, u)
                                 st_code = (st_code + "+bs4_ok") if st_code else "bs4_ok"
                             else:
                                 st_code = (st_code + "+fetch_failed") if st_code else "fetch_failed"
@@ -941,7 +941,7 @@ with tab3:
                 i2, p2, t2 = pick_image_and_price_bs4(r.text, test_url)
                 img = img or i2
                 price = price or p2
-                title = title or t2
+                title = title or normalize_product_title(t2, u)roduct_title(title or t2, test_url)
                 status = (status + "+bs4_ok") if status else "bs4_ok"
                 status = (status + "+bs4_ok") if status else "bs4_ok"
             else:
