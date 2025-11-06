@@ -83,6 +83,23 @@ FINISH_RE  = re.compile(r"(?i)\bFinish\b\s*[:\-]?\s*(.+)")
 SIZE_RE    = re.compile(r"(?i)\b(?:Size|Dimensions?)\b\s*[:\-]?\s*(.+)")
 TYPE_RE    = re.compile(r"(?i)\bType\b\s*[:\-]?\s*(.+)")
 
+# --- Support spelled-out QTY values (e.g., QTY: TWO) ---
+NUMBER_WORDS = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+    "eleven": "11", "twelve": "12",
+    # common shorthand
+    "a": "1", "an": "1"
+}
+
+def _normalize_qty_token(token: str) -> str:
+    if not token:
+        return ""
+    t = token.strip().lower().replace("-", " ")
+    if t.isdigit():
+        return t
+    return NUMBER_WORDS.get(t, "")
+
 # bullets/positions: “1.”, “1 ”, middle dot, small dot
 POS_AT_START = re.compile(r'^\s*(\d{1,3})[.\u2024\u00B7]?\s*')
 NEXT_BULLET  = re.compile(r'\s(\d{1,3})[.\u2024\u00B7](?=\s|[A-Z])')
@@ -114,9 +131,27 @@ def parse_link_title_fields(link_text: str) -> Dict[str, str]:
             fields["Type"] = m.group(1).strip(); continue
         m = QTY_RE.search(tok)
         if m and not fields["QTY"]:
-            q = m.group(1).strip().upper()
-            fields["QTY"] = "" if q == "XX" else q
+            q_raw = m.group(1).strip()
+            q_norm = _normalize_qty_token(q_raw)
+            if q_norm:
+                fields["QTY"] = q_norm
+            else:
+                q_up = q_raw.upper()
+                fields["QTY"] = "" if q_up == "XX" else q_up
             continue
+
+        # Fallback: handle cases like "QTY: TWO" or "Quantity - THREE" when regex didn't catch digits
+        if not fields["QTY"] and ("QTY" in tok.upper() or "QUANTITY" in tok.upper()):
+            after = tok
+            if ":" in tok:
+                after = tok.split(":", 1)[1]
+            elif "-" in tok:
+                after = tok.split("-", 1)[1]
+            word = after.strip().split()[0] if after.strip() else ""
+            q_norm = _normalize_qty_token(word)
+            if q_norm:
+                fields["QTY"] = q_norm
+                continue
         m = FINISH_RE.search(tok)
         if m and not fields["Finish"]:
             fields["Finish"] = m.group(1).strip(); continue
