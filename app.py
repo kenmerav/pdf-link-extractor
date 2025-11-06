@@ -331,9 +331,49 @@ def extract_links_by_pages(
     return pd.DataFrame(rows)
 
 # ========================= Tabs 2/3: Your Firecrawl + parsers =========================
-def pick_image_and_price_bs4(html: str, base_url: str) -> Tuple[str, str]:
-    """Lightweight fallback: og/twitter → JSON-LD → meta → visible $ pattern."""
+def extract_title_from_html(meta: dict, html: str) -> str:
+    """Best-effort product/page title from meta + JSON-LD + visible H1/Title."""
+    title = ""
+    for k in ("og:title", "twitter:title", "title"):
+        v = (meta or {}).get(k)
+        if isinstance(v, (list, tuple)):
+            v = _first_scalar(v)
+        if isinstance(v, str) and v.strip():
+            title = v.strip(); break
+    if not title and html:
+        try:
+            soup = BeautifulSoup(html or "", "lxml")
+            for tag in soup.find_all("script", type="application/ld+json"):
+                try:
+                    data = json.loads(tag.string or "")
+                except Exception:
+                    continue
+                objs = data if isinstance(data, list) else [data]
+                for o in objs:
+                    t = o.get("@type")
+                    if t == "Product" or (isinstance(t, list) and "Product" in t):
+                        nm = o.get("name")
+                        if isinstance(nm, str) and nm.strip():
+                            return nm.strip()
+            h1 = soup.find("h1")
+            if h1 and h1.get_text(strip=True):
+                return h1.get_text(strip=True)
+            if soup.title and soup.title.string:
+                return soup.title.string.strip()
+        except Exception:
+            pass
+    return title.strip()
+
+def pick_image_and_price_bs4(html: str, base_url: str) -> Tuple[str, str, str]:
+    """Lightweight fallback: og/twitter → JSON-LD → meta → visible $ pattern + title."""
     soup = BeautifulSoup(html or "", "lxml")
+    meta_map = {}
+    for m in soup.find_all("meta"):
+        name = (m.get("property") or m.get("name") or "").strip()
+        content = m.get("content")
+        if name and content:
+            meta_map[name] = content
+
     img_url = ""
     for sel in [("meta", {"property":"og:image"}), ("meta", {"name":"og:image"}),
                 ("meta", {"name":"twitter:image"}), ("meta", {"property":"twitter:image"})]:
@@ -387,7 +427,8 @@ def pick_image_and_price_bs4(html: str, base_url: str) -> Tuple[str, str]:
         m = PRICE_RE.search(soup.get_text(" ", strip=True))
         if m: price = m.group(0)
 
-    return img_url or "", price or ""
+    title = extract_title_from_html(meta_map, str(soup))
+    return img_url or "", price or "", title or ""
 
 # --------- Lumens-specific helpers (targets PDP-large + lazyload) ----------
 LUMENS_PDP_RE = re.compile(
@@ -441,7 +482,7 @@ def _first_lumens_pdp_large_from_html(html: str) -> str:
 
     return ""
 
-def parse_image_and_price_lumens_from_v2(scrape: dict) -> Tuple[str, str]:
+def parse_image_and_price_lumens_from_v2(scrape: dict) -> Tuple[str, str, str]:
     """Lumens: prefer PDP-large in markdown/html, then meta/JSON-LD/visible."""
     if not scrape:
         return "", ""
@@ -493,7 +534,8 @@ def parse_image_and_price_lumens_from_v2(scrape: dict) -> Tuple[str, str]:
             m = PRICE_RE.search(t)
             if m: price = m.group(0)
 
-    return img or "", price or ""
+        title = extract_title_from_html(data.get("metadata") or {}, html)
+    return img or "", price or "", title or ""
 
 # ----------------- Firecrawl v2 (REST) helpers -----------------
 def firecrawl_scrape_v2(url: str, api_key: str, mode: str = "simple") -> dict:
@@ -536,11 +578,11 @@ def firecrawl_scrape_v2(url: str, api_key: str, mode: str = "simple") -> dict:
     except Exception:
         return {}
 
-def parse_image_and_price_from_v2_generic(scrape: dict) -> Tuple[str, str]:
-    """Generic Firecrawl parse: OG/Twitter/meta + JSON-LD + visible.
+def parse_image_and_price_from_v2_generic(scrape: dict) -> Tuple[str, str, str]:
+    """Generic Firecrawl parse: OG/Twitter/meta + JSON-LD + visible + title.
     Ensures scalar strings are returned (not lists/dicts) to keep DataFrame columns homogenous.
     """
-    if not scrape: return "", ""
+    if not scrape: return "", "", ""
     data = scrape.get("data") or {}
     meta = data.get("metadata") or {}
     html = data.get("html") or ""
@@ -570,39 +612,41 @@ def parse_image_and_price_from_v2_generic(scrape: dict) -> Tuple[str, str]:
         if not price:
             m = PRICE_RE.search(soup.get_text(" ", strip=True))
             if m: price = m.group(0)
-    return _first_scalar(img) or "", _first_scalar(price) or ""
+    title = extract_title_from_html(meta, html)
+    return _first_scalar(img) or "", _first_scalar(price) or "", _first_scalar(title) or ""
 
-def enrich_domain_firecrawl_v2(url: str, api_key: str) -> Tuple[str, str, str]:
+def enrich_domain_firecrawl_v2(url: str, api_key: str) -> Tuple[str, str, str, str]:
     sc = firecrawl_scrape_v2(url, api_key, mode="simple")
-    img, price = parse_image_and_price_from_v2_generic(sc)
+    img, price, title = parse_image_and_price_from_v2_generic(sc)
     status = "firecrawl_v2_simple"
-    if not img or not price:
+    if not img or not price or not title:
         sc2 = firecrawl_scrape_v2(url, api_key, mode="gentle")
-        i2, p2 = parse_image_and_price_from_v2_generic(sc2)
+        i2, p2, t2 = parse_image_and_price_from_v2_generic(sc2)
         img = img or i2
         price = price or p2
-        status = "firecrawl_v2_gentle" if (i2 or p2) else status
-    return img, price, status
+        title = title or t2
+        status = "firecrawl_v2_gentle" if (i2 or p2 or t2) else status
+    return img, price, title, status
 
-def enrich_wayfair_v2(url: str, api_key: str) -> Tuple[str, str, str]:
-    # (From your version: reuses generic flow)
+def enrich_wayfair_v2(url: str, api_key: str) -> Tuple[str, str, str, str]:
     return enrich_domain_firecrawl_v2(url, api_key)
 
-def enrich_ferguson_v2(url: str, api_key: str) -> Tuple[str, str, str]:
+def enrich_ferguson_v2(url: str, api_key: str) -> Tuple[str, str, str, str]:
     return enrich_domain_firecrawl_v2(url, api_key)
 
-def enrich_lumens_v2(url: str, api_key: str) -> Tuple[str, str, str]:
+def enrich_lumens_v2(url: str, api_key: str) -> Tuple[str, str, str, str]:
     u = canonicalize_url(url)
     sc = firecrawl_scrape_v2(u, api_key, mode="simple")
-    img, price = parse_image_and_price_lumens_from_v2(sc)
+    img, price, title = parse_image_and_price_lumens_from_v2(sc)
     status = "firecrawl_v2_simple"
-    if not img or not price:
+    if not img or not price or not title:
         sc2 = firecrawl_scrape_v2(u, api_key, mode="gentle")
-        i2, p2 = parse_image_and_price_lumens_from_v2(sc2)
+        i2, p2, t2 = parse_image_and_price_lumens_from_v2(sc2)
         img = img or i2
         price = price or p2
-        status = "firecrawl_v2_gentle" if (i2 or p2) else status
-    return img, price, status
+        title = title or t2
+        status = "firecrawl_v2_gentle" if (i2 or p2 or t2) else status
+    return img, price, title, status
 
 # ----------------- Sidebar (API key) -----------------
 with st.sidebar:
@@ -778,6 +822,7 @@ with tab2:
 
                 imgs   = out.get("scraped_image_url", pd.Series([""]*len(out))).astype(str).tolist()
                 prices = out.get("price",               pd.Series([""]*len(out))).astype(str).tolist()
+                titles = out.get("product_title",       pd.Series([""]*len(out))).astype(str).tolist()
                 status = out.get("scrape_status",       pd.Series([""]*len(out))).astype(str).tolist()
 
                 api_key = (api_key or "").strip()
@@ -795,29 +840,32 @@ with tab2:
                         continue
 
                     with Timer() as t:
-                        img = price = ""; st_code = ""
+                        img = price = title = ""; st_code = ""
                         if api_key:
                             if "lumens.com" in u:
-                                img, price, st_code = enrich_lumens_v2(u, api_key)
+                                img, price, title, st_code = enrich_lumens_v2(u, api_key)
                             elif "fergusonhome.com" in u:
-                                img, price, st_code = enrich_ferguson_v2(u, api_key)
+                                img, price, title, st_code = enrich_ferguson_v2(u, api_key)
                             elif "wayfair.com" in u:
-                                img, price, st_code = enrich_wayfair_v2(u, api_key)
+                                img, price, title, st_code = enrich_wayfair_v2(u, api_key)
                             else:
-                                img, price, st_code = enrich_domain_firecrawl_v2(u, api_key)
+                                img, price, title, st_code = enrich_domain_firecrawl_v2(u, api_key)
 
                         if not img or not price:
                             r = requests_get(u)
                             if r and r.text:
-                                i2, p2 = pick_image_and_price_bs4(r.text, u)
+                                i2, p2, t2 = pick_image_and_price_bs4(r.text, u)
                                 img = img or i2
                                 price = price or p2
+                                title = title or t2
                                 st_code = (st_code + "+bs4_ok") if st_code else "bs4_ok"
                             else:
                                 st_code = (st_code + "+fetch_failed") if st_code else "fetch_failed"
 
                         imgs[i] = img
                         prices[i] = price
+                        titles[i] = title
+                        status[i] = st_code
                         status[i] = st_code
 
                     per_link_times.append(t.dt)
@@ -837,6 +885,7 @@ with tab2:
 
                 out["scraped_image_url"] = imgs
                 out["price"] = prices
+                out["product_title"] = titles
                 out["scrape_status"] = status
                 return out
 
@@ -844,7 +893,7 @@ with tab2:
                 with st.spinner("Scraping image + price..."):
                     df_out = enrich_urls(df_in, url_col, api_key_input)
                 # Coerce problematic columns to plain strings to avoid Arrow list/non-list issues
-                for c in ["scraped_image_url", "price", "scrape_status"]:
+                for c in ["scraped_image_url", "price", "product_title", "scrape_status"]:
                     if c in df_out.columns:
                         df_out[c] = df_out[c].apply(_first_scalar).astype(str).fillna("")
                 st.success("Enriched! ✅")
@@ -866,23 +915,25 @@ with tab3:
         "https://www.lumens.com/vishal-chandelier-by-troy-lighting-TRY2622687.html?utm_source=google&utm_medium=PLA&utm_brand=Troy-Lighting&utm_id=TRY2622687&utm_campaign=189692751"
     )
     if st.button("Run test", key="single_test_btn"):
-        img = price = ""; status = ""
+        img = price = title = ""; status = ""
         if api_key_input:
             if "lumens.com" in test_url:
-                img, price, status = enrich_lumens_v2(test_url, api_key_input)
+                img, price, title, status = enrich_lumens_v2(test_url, api_key_input)
             elif "fergusonhome.com" in test_url:
-                img, price, status = enrich_ferguson_v2(test_url, api_key_input)
+                img, price, title, status = enrich_ferguson_v2(test_url, api_key_input)
             elif "wayfair.com" in test_url:
-                img, price, status = enrich_wayfair_v2(test_url, api_key_input)
+                img, price, title, status = enrich_wayfair_v2(test_url, api_key_input)
             else:
-                img, price, status = enrich_domain_firecrawl_v2(test_url, api_key_input)
+                img, price, title, status = enrich_domain_firecrawl_v2(test_url, api_key_input)
 
         if not img or not price:
             r = requests_get(test_url)
             if r and r.text:
-                i2, p2 = pick_image_and_price_bs4(r.text, test_url)
+                i2, p2, t2 = pick_image_and_price_bs4(r.text, test_url)
                 img = img or i2
                 price = price or p2
+                title = title or t2
+                status = (status + "+bs4_ok") if status else "bs4_ok"
                 status = (status + "+bs4_ok") if status else "bs4_ok"
             else:
                 status = (status + "+fetch_failed") if status else "fetch_failed"
@@ -890,5 +941,6 @@ with tab3:
         st.write("**Status:**", status or "unknown")
         st.write("**Image URL:**", img or "—")
         st.write("**Price:**", price or "—")
+        st.write("**Title:**", title or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
