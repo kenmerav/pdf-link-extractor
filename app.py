@@ -1014,8 +1014,7 @@ with tab2:
             with st.expander("Skip list / Auto-skip settings"):
                 csk1, csk2 = st.columns([2,1])
                 with csk1:
-                    current_skip = "
-".join(st.session_state.get("skip_urls", []))
+                    current_skip = "\n".join(st.session_state.get("skip_urls", []))
                     edited_skip = st.text_area(
                         "URLs to skip (one per line)",
                         value=current_skip,
@@ -1027,8 +1026,7 @@ with tab2:
                         st.success("Skip list updated.")
                 with csk2:
                     if st.session_state.get("skip_urls"):
-                        skip_csv = ("
-".join(st.session_state["skip_urls"]).encode("utf-8"))
+                        skip_csv = ("\n".join(st.session_state["skip_urls"]).encode("utf-8"))
                         st.download_button(
                             "Download skip list",
                             data=skip_csv,
