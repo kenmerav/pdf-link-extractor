@@ -483,13 +483,16 @@ def _first_lumens_pdp_large_from_html(html: str) -> str:
     return ""
 
 def parse_image_and_price_lumens_from_v2(scrape: dict) -> Tuple[str, str, str]:
-    """Lumens: prefer PDP-large in markdown/html, then meta/JSON-LD/visible."""
+    """Lumens: prefer PDP-large in markdown/html, then meta/JSON-LD/visible.
+    Always return strings for (img, price, title).
+    """
     if not scrape:
-        return "", ""
+        return "", "", ""
     data = scrape.get("data") or {}
     html = data.get("html") or ""
     md   = data.get("markdown") or ""
 
+    # --- Image ---
     img = ""
     if isinstance(md, str):
         m = LUMENS_PDP_RE.search(md)
@@ -498,6 +501,7 @@ def parse_image_and_price_lumens_from_v2(scrape: dict) -> Tuple[str, str, str]:
     if not img:
         img = _first_lumens_pdp_large_from_html(html)
 
+    # --- Price ---
     price = ""
     j = data.get("json")
     if isinstance(j, dict):
@@ -517,12 +521,14 @@ def parse_image_and_price_lumens_from_v2(scrape: dict) -> Tuple[str, str, str]:
                 t = o.get("@type")
                 if t == "Product" or (isinstance(t, list) and "Product" in t):
                     offers = o.get("offers") or {}
-                    if isinstance(offers, list): offers = offers[0] if offers else {}
+                    if isinstance(offers, list):
+                        offers = offers[0] if offers else {}
                     p = offers.get("price") or (offers.get("priceSpecification") or {}).get("price")
                     if p:
                         price = p if str(p).startswith("$") else f"${p}"
                         break
-            if price: break
+            if price:
+                break
         if not price:
             m = soup.find("meta", attrs={"itemprop": "price"}) or \
                 soup.find("meta", attrs={"property": "product:price:amount"})
@@ -532,9 +538,12 @@ def parse_image_and_price_lumens_from_v2(scrape: dict) -> Tuple[str, str, str]:
         if not price:
             t = soup.get_text(" ", strip=True)
             m = PRICE_RE.search(t)
-            if m: price = m.group(0)
+            if m:
+                price = m.group(0)
 
-        title = extract_title_from_html(data.get("metadata") or {}, html)
+    # --- Title (compute independently so it's always defined) ---
+    title = extract_title_from_html(data.get("metadata") or {}, html)
+
     return img or "", price or "", title or ""
 
 # ----------------- Firecrawl v2 (REST) helpers -----------------
