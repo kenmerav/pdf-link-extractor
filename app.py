@@ -1001,4 +1001,113 @@ with tab2:
                 )
             with c2:
                 start_at = st.number_input(
-                    "Skip first N pending", min_value=0, max_value=100000, value=0, ste
+                    "Skip first N pending", min_value=0, max_value=100000, value=0, step=1,
+                    help="Start after this many pending rows (for manual resume)."
+                )
+            with c3:
+                autosave_every = st.number_input(
+                    "Autosave every N rows", min_value=0, max_value=1000, value=25, step=5,
+                    help="0 = off. Saves a partial CSV to memory you can download if the run stops."
+                )
+
+            # Skip list + auto-skip controls
+            with st.expander("Skip list / Auto-skip settings"):
+                csk1, csk2 = st.columns([2,1])
+                with csk1:
+                    current_skip = "
+".join(st.session_state.get("skip_urls", []))
+                    edited_skip = st.text_area(
+                        "URLs to skip (one per line)",
+                        value=current_skip,
+                        height=120,
+                        help="Any URL here will be skipped during enrichment."
+                    )
+                    if st.button("Update skip list"):
+                        st.session_state["skip_urls"] = [u.strip() for u in edited_skip.splitlines() if u.strip()]
+                        st.success("Skip list updated.")
+                with csk2:
+                    if st.session_state.get("skip_urls"):
+                        skip_csv = ("
+".join(st.session_state["skip_urls"]).encode("utf-8"))
+                        st.download_button(
+                            "Download skip list",
+                            data=skip_csv,
+                            file_name="skip_urls.txt",
+                            mime="text/plain",
+                        )
+
+                csk3, csk4 = st.columns([1,1])
+                with csk3:
+                    st.session_state["enable_auto_skip"] = st.checkbox(
+                        "Enable auto-skip after N failures", value=bool(st.session_state.get("enable_auto_skip", True))
+                    )
+                with csk4:
+                    st.session_state["auto_skip_after_n"] = st.number_input(
+                        "N failures", min_value=1, max_value=10, value=int(st.session_state.get("auto_skip_after_n", 2)), step=1
+                    )
+
+                if st.session_state.get("fail_counts"):
+                    st.write("Failure counts (this session):", st.session_state["fail_counts"])
+
+            # Autosave download if available
+            if st.session_state.get("last_partial_csv"):
+                st.download_button(
+                    "Download latest autosave",
+                    data=st.session_state["last_partial_csv"],
+                    file_name="links_enriched_partial.csv",
+                    mime="text/csv",
+                )
+
+            if st.button("Enrich (Image URL + Price + Title)", key="enrich_btn"):
+                with st.spinner("Scraping image + price + product title..."):
+                    df_out = enrich_urls(
+                        df_in, url_col, api_key_input,
+                        max_per_run=int(max_per_run), start_at=int(start_at), autosave_every=int(autosave_every)
+                    )
+                st.success("Enriched! ✅")
+                st.dataframe(df_out, use_container_width=True)
+                st.caption(df_out["scrape_status"].value_counts(dropna=False).to_frame("count"))
+                out_csv = df_out.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download enriched CSV",
+                    data=out_csv,
+                    file_name="links_enriched.csv",
+                    mime="text/csv",
+                )
+
+# --- Tab 3: Test a single URL ---
+with tab3:
+    st.caption("Paste a single product URL and test the enrichment (Firecrawl v2 first, then fallback).")
+    test_url = st.text_input(
+        "Product URL to test",
+        "https://www.lumens.com/vishal-chandelier-by-troy-lighting-TRY2622687.html"
+    )
+    if st.button("Run test", key="single_test_btn"):
+        img = price = title = ""; status = ""
+        if api_key_input:
+            if "lumens.com" in test_url:
+                img, price, title, status = enrich_lumens_v2(test_url, api_key_input)
+            elif "fergusonhome.com" in test_url:
+                img, price, title, status = enrich_ferguson_v2(test_url, api_key_input)
+            elif "wayfair.com" in test_url:
+                img, price, title, status = enrich_wayfair_v2(test_url, api_key_input)
+            else:
+                img, price, title, status = enrich_domain_firecrawl_v2(test_url, api_key_input)
+
+        if not img or not price or not title:
+            r = requests_get(test_url)
+            if r and r.text:
+                i2, p2, t2 = pick_image_and_price_bs4(r.text, test_url)
+                img = img or _first_scalar(i2)
+                price = price or _first_scalar(p2)
+                title = title or normalize_product_title(_first_scalar(t2), test_url)
+                status = (status + "+bs4_ok") if status else "bs4_ok"
+            else:
+                status = (status + "+fetch_failed") if status else "fetch_failed"
+
+        st.write("**Status:**", status or "unknown")
+        st.write("**Image URL:**", img or "—")
+        st.write("**Price:**", price or "—")
+        st.write("**Product title:**", title or "—")
+        if img:
+            st.image(img, caption="Preview", use_container_width=True)
