@@ -863,8 +863,14 @@ with tab2:
                         return out
 
                 urls = out[url_col].astype(str).fillna("").tolist()
-                if "scraped_image_url" in out.columns and "price" in out.columns:
-                    mask_done = out["scraped_image_url"].astype(str).ne("") & out["price"].astype(str).ne("")
+
+                # Determine which rows still need work
+                if "scraped_image_url" in out.columns and "price" in out.columns and "product_title" in out.columns:
+                    mask_done = (
+                        out["scraped_image_url"].astype(str).ne("") &
+                        out["price"].astype(str).ne("") &
+                        out["product_title"].astype(str).ne("")
+                    )
                 else:
                     mask_done = pd.Series([False]*len(out), index=out.index)
 
@@ -885,7 +891,7 @@ with tab2:
                 for k, i in enumerate(idxs, start=1):
                     u = urls[i].strip()
                     if not u:
-                        imgs[i] = ""; prices[i] = ""; status[i] = "no_url"
+                        imgs[i] = ""; prices[i] = ""; titles[i] = ""; status[i] = "no_url"
                         prog.progress(k/len(idxs))
                         continue
 
@@ -901,13 +907,84 @@ with tab2:
                             else:
                                 img, price, title, st_code = enrich_domain_firecrawl_v2(u, api_key)
 
+                        # Fallback to direct fetch + bs4 if any field missing
                         if not img or not price or not title:
+                            r = requests_get(u)
+                            if r and r.text:
+                                i2, p2, t2 = pick_image_and_price_bs4(r.text, u)
+                                img = img or i2
+                                price = price or p2
+                                title = title or normalize_product_title(t2, u)
+                                st_code = (st_code + "+bs4_ok") if st_code else "bs4_ok"
+                            else:
+                                st_code = (st_code + "+fetch_failed") if st_code else "fetch_failed"
+
+                        imgs[i] = _first_scalar(img)
+                        prices[i] = _first_scalar(price)
+                        titles[i] = _first_scalar(title)
+                        status[i] = _first_scalar(st_code)
+
+                    per_link_times.append(t.dt)
+                    avg = sum(per_link_times) / max(len(per_link_times), 1)
+                    remaining = (len(idxs) - k) * avg
+                    status_box.write(
+                        f"Processed {k}/{len(idxs)} • last {t.dt:.2f}s • avg {avg:.2f}s/link • ETA ~{int(remaining)}s"
+                    )
+                    prog.progress(k/len(idxs))
+                    time.sleep(0.10)
+
+                total = time.perf_counter() - t_start
+                if idxs:
+                    status_box.write(f"Done {len(idxs)} link(s) in {total:.1f}s • avg {(total/len(idxs)):.2f}s/link")
+                else:
+                    status_box.write("Nothing to do — all rows already enriched.")
+
+                out["scraped_image_url"] = imgs
+                out["price"] = prices
+                out["product_title"] = titles
+                out["scrape_status"] = status
+                return out
+
+            if st.button("Enrich (Image URL + Price)", key="enrich_btn"):
+                with st.spinner("Scraping image + price + title..."):
+                    df_out = enrich_urls(df_in, url_col, api_key_input)
+                st.success("Enriched! ✅")
+                st.dataframe(df_out, use_container_width=True)
+                st.caption(df_out["scrape_status"].value_counts(dropna=False).to_frame("count"))
+                out_csv = df_out.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download enriched CSV",
+                    data=out_csv,
+                    file_name="links_enriched.csv",
+                    mime="text/csv",
+                )
+
+# --- Tab 3: Test a single URL ---
+with tab3:
+    st.caption("Paste a single product URL and test the enrichment (Firecrawl v2 first, then fallback).")
+    test_url = st.text_input(
+        "Product URL to test",
+        "https://www.lumens.com/vishal-chandelier-by-troy-lighting-TRY2622687.html"
+    )
+    if st.button("Run test", key="single_test_btn"):
+        img = price = title = ""; status = ""
+        if api_key_input:
+            if "lumens.com" in test_url:
+                img, price, title, status = enrich_lumens_v2(test_url, api_key_input)
+            elif "fergusonhome.com" in test_url:
+                img, price, title, status = enrich_ferguson_v2(test_url, api_key_input)
+            elif "wayfair.com" in test_url:
+                img, price, title, status = enrich_wayfair_v2(test_url, api_key_input)
+            else:
+                img, price, title, status = enrich_domain_firecrawl_v2(test_url, api_key_input)
+
+        if not img or not price or not title:
             r = requests_get(test_url)
             if r and r.text:
                 i2, p2, t2 = pick_image_and_price_bs4(r.text, test_url)
                 img = img or i2
                 price = price or p2
-                title = normalize_product_title(title or t2, test_url)
+                title = title or normalize_product_title(t2, test_url)
                 status = (status + "+bs4_ok") if status else "bs4_ok"
             else:
                 status = (status + "+fetch_failed") if status else "fetch_failed"
