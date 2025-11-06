@@ -853,104 +853,23 @@ with tab2:
             url_col_guess = "Product URL" if "Product URL" in df_in.columns else df_in.columns[min(1, len(df_in)-1)]
             url_col = st.text_input("URL column name", url_col_guess)
 
-            def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str]) -> pd.DataFrame:
-                out = df.copy()
-                if url_col not in out.columns:
-                    if len(out.columns) >= 2:
-                        url_col = out.columns[1]
-                    else:
-                        st.error(f"URL column '{url_col}' not found.")
-                        return out
+            # New: chunk & resume controls
+            c1, c2, c3 = st.columns([1,1,1])
+            max_per_run = c1.number_input("Max per run", min_value=1, max_value=2000, value=100, step=50, help="Process at most this many pending rows on this click.")
+            start_at   = c2.number_input("Skip first N pending", min_value=0, max_value=100000, value=0, step=10, help="Useful to manually resume if needed.")
+            autosave_every = c3.number_input("Autosave every N", min_value=5, max_value=500, value=25, step=5, help="Saves a partial CSV in session_state so you never lose progress.")
 
-                urls = out[url_col].astype(str).fillna("").tolist()
-
-                # Determine which rows still need work
-                if "scraped_image_url" in out.columns and "price" in out.columns and "product_title" in out.columns:
-                    mask_done = (
-                        out["scraped_image_url"].astype(str).ne("") &
-                        out["price"].astype(str).ne("") &
-                        out["product_title"].astype(str).ne("")
-                    )
-                else:
-                    mask_done = pd.Series([False]*len(out), index=out.index)
-
-                idxs = [i for i, done in enumerate(mask_done) if not done]
-
-                imgs   = out.get("scraped_image_url", pd.Series([""]*len(out))).astype(str).tolist()
-                prices = out.get("price",               pd.Series([""]*len(out))).astype(str).tolist()
-                titles = out.get("product_title",       pd.Series([""]*len(out))).astype(str).tolist()
-                status = out.get("scrape_status",       pd.Series([""]*len(out))).astype(str).tolist()
-
-                api_key = (api_key or "").strip()
-
-                prog = st.progress(0)
-                status_box = st.empty()
-                t_start = time.perf_counter()
-                per_link_times = []
-
-                for k, i in enumerate(idxs, start=1):
-                    u = urls[i].strip()
-                    if not u:
-                        imgs[i] = ""; prices[i] = ""; titles[i] = ""; status[i] = "no_url"
-                        prog.progress(k/len(idxs))
-                        continue
-
-                    with Timer() as t:
-                        img = price = title = ""; st_code = ""
-                        if api_key:
-                            if "lumens.com" in u:
-                                img, price, title, st_code = enrich_lumens_v2(u, api_key)
-                            elif "fergusonhome.com" in u:
-                                img, price, title, st_code = enrich_ferguson_v2(u, api_key)
-                            elif "wayfair.com" in u:
-                                img, price, title, st_code = enrich_wayfair_v2(u, api_key)
-                            else:
-                                img, price, title, st_code = enrich_domain_firecrawl_v2(u, api_key)
-
-                        # Fallback to direct fetch + bs4 if any field missing
-                        if not img or not price or not title:
-                            r = requests_get(u)
-                            if r and r.text:
-                                i2, p2, t2 = pick_image_and_price_bs4(r.text, u)
-                                img = img or i2
-                                price = price or p2
-                                title = title or normalize_product_title(t2, u)
-                                st_code = (st_code + "+bs4_ok") if st_code else "bs4_ok"
-                            else:
-                                st_code = (st_code + "+fetch_failed") if st_code else "fetch_failed"
-
-                        imgs[i] = _first_scalar(img)
-                        prices[i] = _first_scalar(price)
-                        titles[i] = _first_scalar(title)
-                        status[i] = _first_scalar(st_code)
-
-                    per_link_times.append(t.dt)
-                    avg = sum(per_link_times) / max(len(per_link_times), 1)
-                    remaining = (len(idxs) - k) * avg
-                    status_box.write(
-                        f"Processed {k}/{len(idxs)} • last {t.dt:.2f}s • avg {avg:.2f}s/link • ETA ~{int(remaining)}s"
-                    )
-                    prog.progress(k/len(idxs))
-                    time.sleep(0.10)
-
-                total = time.perf_counter() - t_start
-                if idxs:
-                    status_box.write(f"Done {len(idxs)} link(s) in {total:.1f}s • avg {(total/len(idxs)):.2f}s/link")
-                else:
-                    status_box.write("Nothing to do — all rows already enriched.")
-
-                out["scraped_image_url"] = imgs
-                out["price"] = prices
-                out["product_title"] = titles
-                out["scrape_status"] = status
-                return out
-
-            if st.button("Enrich (Image URL + Price)", key="enrich_btn"):
+            if st.button("Enrich (Image URL + Price + Title)", key="enrich_btn"):
                 with st.spinner("Scraping image + price + title..."):
-                    df_out = enrich_urls(df_in, url_col, api_key_input)
+                    df_out = enrich_urls(df_in, url_col, api_key_input, max_per_run=max_per_run, start_at=start_at, autosave_every=autosave_every)
                 st.success("Enriched! ✅")
                 st.dataframe(df_out, use_container_width=True)
-                st.caption(df_out["scrape_status"].value_counts(dropna=False).to_frame("count"))
+
+                # Quick counts widget
+                counts = df_out["scrape_status"].value_counts(dropna=False).to_frame("count")
+                st.caption(counts)
+
+                # Download full result
                 out_csv = df_out.to_csv(index=False).encode("utf-8")
                 st.download_button(
                     "Download enriched CSV",
@@ -958,6 +877,16 @@ with tab2:
                     file_name="links_enriched.csv",
                     mime="text/csv",
                 )
+
+                # Also expose the latest autosave if user wants the partial immediately
+                if st.session_state.get("last_partial_csv"):
+                    st.download_button(
+                        "Download latest autosave (partial)",
+                        data=st.session_state["last_partial_csv"],
+                        file_name="links_enriched_autosave.csv",
+                        mime="text/csv",
+                        key="autosave_dl"
+                    )
 
 # --- Tab 3: Test a single URL ---
 with tab3:
