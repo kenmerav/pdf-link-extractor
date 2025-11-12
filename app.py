@@ -321,22 +321,15 @@ def extract_links_by_pages(
                 continue
             fields = parse_link_title_fields(title)
 
-            # --- Build Client Name = Tags + Type (e.g., "Laundry Door") ---
-            type_val = fields.get("Type", "")
-            tags_clean = (tag_value or "").strip()
-            type_clean = (type_val or "").strip()
-            client_name = " ".join([t for t in [tags_clean, type_clean.title()] if t])
-
             rows.append({
                 "page": pidx,
                 "Tags": tag_value,
                 "Room": room_value,
                 "Position": position,
-                "Type": type_val,
+                "Type": fields.get("Type", ""),
                 "QTY": fields.get("QTY", ""),
                 "Finish": fields.get("Finish", ""),
                 "Size": fields.get("Size", ""),
-                "Client Name": client_name,
                 "link_url": uri,
                 "link_text": title,
             })
@@ -511,7 +504,7 @@ def _first_lumens_pdp_large_from_html(html: str) -> str:
 
     soup = BeautifulSoup(html, "lxml")
     for im in soup.find_all("img"):
-        for attr in ("data-src", "data-original", "data-zoom-image", "data-large_image", "data-large-image", "src"):
+        for attr in ("data-src", "data-original", "data-zoom-image", "data-large_image", "src"):
             v = im.get(attr)
             if isinstance(v, str) and "$Lumens.com-PDP-large$" in v:
                 return v
@@ -958,7 +951,6 @@ if st.session_state.get("extracted_df") is not None:
         "Size": st.column_config.TextColumn("Size", disabled=True),
         "link_url": st.column_config.TextColumn("link_url", disabled=True),
         "link_text": st.column_config.TextColumn("link_text", disabled=True),
-        "Client Name": st.column_config.TextColumn("Client Name", disabled=True),
     }
 
     # Edits apply only when you click Save — avoids partial reruns breaking choices
@@ -997,7 +989,15 @@ with tab2:
 
         if df_in is not None:
             st.write("Preview:", df_in.head())
-            url_col_guess = "Product URL" if "Product URL" in df_in.columns else df_in.col
+            url_col_guess = "Product URL" if "Product URL" in df_in.columns else df_in.columns[min(1, len(df_in)-1)]
+            url_col = st.text_input("URL column name", url_col_guess)
+
+            # Chunk & resume controls
+            c1, c2, c3 = st.columns([1, 1, 1])
+            with c1:
+                max_per_run = st.number_input(
+                    "Max per run", min_value=1, max_value=2000, value=100, step=50,
+                    help="Process at most this many pending rows on this click."
                 )
             with c2:
                 start_at = st.number_input(
@@ -1109,5 +1109,3 @@ with tab3:
         st.write("**Product title:**", title or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
-
-
