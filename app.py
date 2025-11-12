@@ -272,7 +272,7 @@ ROOM_MAP_RAW = [
 ]
 
 ROOM_MAP: Dict[str, str] = {k.lower(): v for (k, v) in ROOM_MAP_RAW}
-ROOM_OPTIONS = ["", "Lighting", "Plumbing", "Other"]
+ROOM_OPTIONS = ["", "LIGHTING", "PLUMBING", "PAINT", "COUNTERTOPS + SLABS", "CABINETRY FINISHES", "HARDWARE", "TILE + STONE", "ACCENT MIRRORS", "DOORS, BASE, CASE", "WALLCOVERING", "APPLIANCES"]
 
 def _infer_room_from_tag(tag_val: str) -> str:
     """
@@ -1109,3 +1109,4 @@ with tab3:
         st.write("**Product title:**", title or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
