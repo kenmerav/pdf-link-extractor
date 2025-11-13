@@ -290,6 +290,31 @@ def _infer_room_from_tag(tag_val: str) -> str:
             best_key = k
     return ROOM_MAP.get(best_key, "")
 
+from urllib.parse import urlparse as _urlparse_for_vendor
+
+def _vendor_from_url(url: str) -> str:
+    """
+    Extract a simple vendor name from a URL.
+    Example: https://www.wayfair.com/... -> 'wayfair'
+    """
+    if not url:
+        return ""
+    try:
+        host = _urlparse_for_vendor(url).netloc.lower()
+    except Exception:
+        return ""
+    # drop common prefixes like www, m, amp
+    parts = [p for p in host.split(".") if p and p not in ("www", "m", "amp")]
+    if not parts:
+        return ""
+    # simple heuristic: use the second-to-last part for typical .com domains
+    if len(parts) >= 2:
+        base = parts[-2]
+    else:
+        base = parts[0]
+    return base
+
+
 def extract_links_by_pages(
     pdf_bytes: bytes,
     page_to_tag: Optional[Dict[int, str]],
@@ -321,6 +346,7 @@ def extract_links_by_pages(
                 continue
 
             fields = parse_link_title_fields(title)
+            vendor = _vendor_from_url(uri)
 
             rows.append({
                 "page": pidx,
@@ -331,6 +357,7 @@ def extract_links_by_pages(
                 "QTY": fields.get("QTY", ""),
                 "Finish": fields.get("Finish", ""),
                 "Size": fields.get("Size", ""),
+                "Vendor": vendor,
                 "link_url": uri,
                 "link_text": title,
                 "Client Name": f"{tag_value.strip()} {fields.get('Type', '').strip()}".strip(),
@@ -1112,5 +1139,6 @@ with tab3:
         st.write("**Product title:**", title or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
 
 
