@@ -347,21 +347,22 @@ def extract_links_by_pages(
 
             fields = parse_link_title_fields(title)
             vendor = _vendor_from_url(uri)
+            
+rows.append({
+    "page": pidx,
+    "Tags": tag_value,
+    "Room": room_col,
+    "Position": position,
+    "Type": type_col,
+    "QTY": fields.get("QTY", ""),
+    "Finish": fields.get("Finish", ""),
+    "Size": fields.get("Size", ""),
+    "link_url": uri,
+    "link_text": title,
+    # Still build Client Name from original Tags + parsed Type
+    "Client Name": f"{tag_value.strip()} {fields.get('Type', '').strip()}".strip(),
+})
 
-            rows.append({
-                "page": pidx,
-                "Tags": tag_value,
-                "Room": room_value,
-                "Position": position,
-                "Type": fields.get("Type", ""),
-                "QTY": fields.get("QTY", ""),
-                "Finish": fields.get("Finish", ""),
-                "Size": fields.get("Size", ""),
-                "Vendor": vendor,
-                "link_url": uri,
-                "link_text": title,
-                "Client Name": f"{tag_value.strip()} {fields.get('Type', '').strip()}".strip(),
-            })
 
     return pd.DataFrame(rows)
 
@@ -1139,6 +1140,7 @@ with tab3:
         st.write("**Product title:**", title or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
 
 
 
