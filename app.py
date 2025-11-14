@@ -359,12 +359,12 @@ rows.append({
     "Size": fields.get("Size", ""),
     "link_url": uri,
     "link_text": title,
-    # Still build Client Name from original Tags + parsed Type
     "Client Name": f"{tag_value.strip()} {fields.get('Type', '').strip()}".strip(),
+    "Vendor": _vendor_from_url(uri),
 })
 
-
 return pd.DataFrame(rows)
+
 
 # ========================= Tabs 2/3: Your Firecrawl + parsers =========================
 # --- Title normalization helper (keeps just the product name like 'Sawyer Chandelier') ---
@@ -1140,6 +1140,7 @@ with tab3:
         st.write("**Product title:**", title or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
 
 
 
