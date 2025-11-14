@@ -364,19 +364,20 @@ def extract_links_by_pages(
                 type_col = fields.get("Type", "")
 
             rows.append({
-                "page": pidx,
-                "Tags": tag_value,
-                "Room": room_col,
-                "Position": position,
-                "Type": type_col,
-                "QTY": fields.get("QTY", ""),
-                "Finish": fields.get("Finish", ""),
-                "Size": fields.get("Size", ""),
-                "link_url": uri,
-                "link_text": title,
-                # Still build Client Name from original Tags + parsed Type
-                "Client Name": f"{tag_value.strip()} {fields.get('Type', '').strip()}".strip(),
-            })
+    "page": pidx,
+    "Tags": tag_value,
+    "Room": room_col,
+    "Position": position,
+    "Type": type_col,
+    "QTY": fields.get("QTY", ""),
+    "Finish": fields.get("Finish", ""),
+    "Size": fields.get("Size", ""),
+    "link_url": uri,
+    "link_text": title,
+    "Client Name": f"{tag_value.strip()} {fields.get('Type', '').strip()}".strip(),
+    "Vendor": _vendor_from_url(uri),
+})
+
 
     return pd.DataFrame(rows)
 
@@ -1005,7 +1006,6 @@ if st.session_state.get("pending_extract") and st.session_state.get("pdf_bytes")
 
 # Always render editable table if we have data
 # Always render editable table if we have data
-# Always render editable table if we have data
 if st.session_state.get("extracted_df") is not None:
     st.caption("Edit the appropriate column per row, then click **Save room edits**. When you're done, download the CSV.")
 
@@ -1083,59 +1083,11 @@ if st.session_state.get("extracted_df") is not None:
             "link_text": st.column_config.TextColumn("link_text", disabled=True),
         }
 
-    # NOTE: new, unique form key here: "room_editor_v2"
+    # Single form + single editor, with unique keys
     with st.form("room_editor_v2"):
         edited_df = st.data_editor(
             df_show,
-            key="links_editor",
-            use_container_width=True,
-            hide_index=True,
-            num_rows="fixed",
-            column_config=col_cfg,
-        )
-        saved = st.form_submit_button("Save room edits", type="primary")
-
-    if saved:
-        st.session_state["extracted_df"] = edited_df
-        st.success("Room edits saved.")
-
-    st.download_button(
-        "Download CSV",
-        st.session_state["extracted_df"].to_csv(index=False).encode("utf-8"),
-        file_name="canva_links_with_position.csv",
-        mime="text/csv",
-    )
-
-
-    # Edits apply only when you click Save — avoids partial reruns breaking choices
-    with st.form("room_editor"):
-        edited_df = st.data_editor(
-            df_show,
-            key="links_editor",
-            use_container_width=True,
-            hide_index=True,
-            num_rows="fixed",
-            column_config=col_cfg,
-        )
-        saved = st.form_submit_button("Save room edits", type="primary")
-
-    if saved:
-        st.session_state["extracted_df"] = edited_df
-        st.success("Room edits saved.")
-
-    st.download_button(
-        "Download CSV",
-        st.session_state["extracted_df"].to_csv(index=False).encode("utf-8"),
-        file_name="canva_links_with_position.csv",
-        mime="text/csv",
-    )
-
-
-    # Edits apply only when you click Save — avoids partial reruns breaking choices
-    with st.form("room_editor"):
-        edited_df = st.data_editor(
-            df_show,
-            key="links_editor",
+            key="links_editor_v2",
             use_container_width=True,
             hide_index=True,
             num_rows="fixed",
@@ -1287,6 +1239,7 @@ with tab3:
         st.write("**Product title:**", title or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
 
 
 
