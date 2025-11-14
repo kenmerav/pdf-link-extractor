@@ -322,6 +322,7 @@ def extract_links_by_pages(
     only_listed_pages: bool = True,
     pad_px: float = 4.0,
     band_px: float = 28.0,
+    view_mode: str = "trade",  # "trade" (old behavior) or "room"
 ) -> pd.DataFrame:
     doc = fitz.open("pdf", pdf_bytes)
     rows = []
@@ -330,6 +331,7 @@ def extract_links_by_pages(
     for pidx, page in enumerate(doc, start=1):
         if only_listed_pages and page_to_tag and pidx not in listed:
             continue
+
         tag_value = (page_to_tag or {}).get(pidx, "")
         room_value = (page_to_room or {}).get(pidx, _infer_room_from_tag(tag_value))
 
@@ -341,27 +343,42 @@ def extract_links_by_pages(
             rect = lnk.get("from")
             raw = extract_link_title_strict(page, rect, pad_px=pad_px, band_px=band_px)
             position, title = split_position_and_title_start(raw)
+
             # Ignore common headings like "MATERIALS LIST"
             if not title or title.strip().lower().startswith(("materials list", "material list")):
                 continue
 
             fields = parse_link_title_fields(title)
-            vendor = _vendor_from_url(uri)
-            
-rows.append({
-    "page": pidx,
-    "Tags": tag_value,
-    "Room": room_col,
-    "Position": position,
-    "Type": type_col,
-    "QTY": fields.get("QTY", ""),
-    "Finish": fields.get("Finish", ""),
-    "Size": fields.get("Size", ""),
-    "link_url": uri,
-    "link_text": title,
-    "Client Name": f"{tag_value.strip()} {fields.get('Type', '').strip()}".strip(),
-    "Vendor": _vendor_from_url(uri),
-})
+
+            # --- View-mode mapping logic ---
+            # Trade View (existing behavior):
+            #   Room  = room_value (inferred / dropdown)
+            #   Type  = parsed from link text (fields["Type"])
+            #
+            # Room View (new behavior):
+            #   Room  = tag_value (what you entered in the Tags table)
+            #   Type  = parsed from link text initially; you will overwrite via dropdown in UI
+            if view_mode == "room":
+                room_col = tag_value
+                type_col = fields.get("Type", "")
+            else:
+                room_col = room_value
+                type_col = fields.get("Type", "")
+
+            rows.append({
+                "page": pidx,
+                "Tags": tag_value,
+                "Room": room_col,
+                "Position": position,
+                "Type": type_col,
+                "QTY": fields.get("QTY", ""),
+                "Finish": fields.get("Finish", ""),
+                "Size": fields.get("Size", ""),
+                "link_url": uri,
+                "link_text": title,
+                "Client Name": f"{tag_value.strip()} {fields.get('Type', '').strip()}".strip(),
+                "Vendor": _vendor_from_url(uri),
+            })
 
     return pd.DataFrame(rows)
 
@@ -1140,6 +1157,7 @@ with tab3:
         st.write("**Product title:**", title or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
 
 
 
