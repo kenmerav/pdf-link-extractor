@@ -322,6 +322,7 @@ def extract_links_by_pages(
     only_listed_pages: bool = True,
     pad_px: float = 4.0,
     band_px: float = 28.0,
+    view_mode: str = "trade",  # "trade" (old behavior) or "room"
 ) -> pd.DataFrame:
     doc = fitz.open("pdf", pdf_bytes)
     rows = []
@@ -346,24 +347,39 @@ def extract_links_by_pages(
                 continue
 
             fields = parse_link_title_fields(title)
-            vendor = _vendor_from_url(uri)
+
+            # --- View-mode mapping logic ---
+            # Trade View (existing behavior):
+            #   Room  = room_value (inferred or dropdown)
+            #   Type  = parsed from link text (fields["Type"])
+            #
+            # Room View (your new behavior):
+            #   Room  = tag_value      (what you previously called Tags)
+            #   Type  = room_value     (what the dropdown currently controls)
+            if view_mode == "room":
+                room_col = tag_value
+                type_col = room_value
+            else:
+                room_col = room_value
+                type_col = fields.get("Type", "")
 
             rows.append({
                 "page": pidx,
                 "Tags": tag_value,
-                "Room": room_value,
+                "Room": room_col,
                 "Position": position,
-                "Type": fields.get("Type", ""),
+                "Type": type_col,
                 "QTY": fields.get("QTY", ""),
                 "Finish": fields.get("Finish", ""),
                 "Size": fields.get("Size", ""),
-                "Vendor": vendor,
                 "link_url": uri,
                 "link_text": title,
+                # Still build Client Name from original Tags + parsed Type
                 "Client Name": f"{tag_value.strip()} {fields.get('Type', '').strip()}".strip(),
             })
 
     return pd.DataFrame(rows)
+
 
 # ========================= Tabs 2/3: Your Firecrawl + parsers =========================
 # --- Title normalization helper (keeps just the product name like 'Sawyer Chandelier') ---
@@ -907,12 +923,34 @@ with tab1:
     st.markdown("**Page → Tags table**")
     default_df = pd.DataFrame([{"page": "", "Tags": ""}])
     mapping_df = st.data_editor(
-        default_df, num_rows="dynamic", use_container_width=True, key="page_tag_editor",
+        default_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="page_tag_editor",
         column_config={
             "page": st.column_config.TextColumn("page", help="Page number (1-based)"),
-            "Tags": st.column_config.TextColumn("Tags", help="Room name for that page"),
+            "Tags": st.column_config.TextColumn("Tags", help="Label for that page (used differently per view)"),
         }
     )
+
+    # --- View mode controls (Trade View / Room View) ---
+    col_view1, col_view2 = st.columns(2)
+    with col_view1:
+        trade_view = st.checkbox("Trade View", value=True)
+    with col_view2:
+        room_view = st.checkbox("Room View", value=False)
+
+    # Derive active mode:
+    # - If Room View is explicitly checked *without* Trade View -> "room"
+    # - Otherwise default to "trade"
+    if room_view and not trade_view:
+        view_mode = "room"
+    else:
+        view_mode = "trade"
+
+    # Store for use at extraction time
+    st.session_state["extract_view_mode"] = view_mode
+
     only_listed = st.checkbox("Only extract pages listed above", value=True)
     pad_px = st.slider("Link capture pad (pixels)", 0, 16, 4, 1)
     band_px = st.slider("Nearby text band (pixels)", 0, 60, 28, 2)
@@ -925,6 +963,7 @@ with tab1:
         on_click=_start_extract,
     )
 
+# Perform extraction after the UI is declared so button clicks set the flag first
 # Perform extraction after the UI is declared so button clicks set the flag first
 if st.session_state.get("pending_extract") and st.session_state.get("pdf_bytes") is not None:
     # Build mapping from editor
@@ -947,15 +986,22 @@ if st.session_state.get("pending_extract") and st.session_state.get("pdf_bytes")
         # If mapping_df isn't in scope (rare), just extract all pages without tags
         page_to_tag = {}
 
+    # Get view mode from session (default to trade if somehow unset)
+    view_mode = st.session_state.get("extract_view_mode", "trade")
+
     with st.spinner("Extracting links, positions & titles…"):
         df = extract_links_by_pages(
-            st.session_state["pdf_bytes"], page_to_tag, None,
+            st.session_state["pdf_bytes"],
+            page_to_tag,
+            None,
             only_listed_pages=only_listed,
             pad_px=pad_px,
-            band_px=band_px
+            band_px=band_px,
+            view_mode=view_mode,
         )
     st.session_state["extracted_df"] = df if not df.empty else None
     st.session_state["pending_extract"] = False
+
 
 # Always render editable table if we have data
 if st.session_state.get("extracted_df") is not None:
@@ -1139,6 +1185,7 @@ with tab3:
         st.write("**Product title:**", title or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
 
 
 
