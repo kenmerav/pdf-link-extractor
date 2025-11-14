@@ -322,7 +322,6 @@ def extract_links_by_pages(
     only_listed_pages: bool = True,
     pad_px: float = 4.0,
     band_px: float = 28.0,
-    view_mode: str = "trade",  # "trade" (old behavior) or "room"
 ) -> pd.DataFrame:
     doc = fitz.open("pdf", pdf_bytes)
     rows = []
@@ -347,40 +346,24 @@ def extract_links_by_pages(
                 continue
 
             fields = parse_link_title_fields(title)
-
-            # --- View-mode mapping logic ---
-            # Trade View (existing behavior):
-            #   Room  = room_value (inferred / dropdown)
-            #   Type  = parsed from link text (fields["Type"])
-            #
-            # Room View (new behavior):
-            #   Room  = tag_value (what you entered in the Tags table)
-            #   Type  = parsed from link text initially; you will overwrite via dropdown in UI
-            if view_mode == "room":
-                room_col = tag_value
-                type_col = fields.get("Type", "")
-            else:
-                room_col = room_value
-                type_col = fields.get("Type", "")
+            vendor = _vendor_from_url(uri)
 
             rows.append({
-    "page": pidx,
-    "Tags": tag_value,
-    "Room": room_col,
-    "Position": position,
-    "Type": type_col,
-    "QTY": fields.get("QTY", ""),
-    "Finish": fields.get("Finish", ""),
-    "Size": fields.get("Size", ""),
-    "link_url": uri,
-    "link_text": title,
-    "Client Name": f"{tag_value.strip()} {fields.get('Type', '').strip()}".strip(),
-    "Vendor": _vendor_from_url(uri),
-})
-
+                "page": pidx,
+                "Tags": tag_value,
+                "Room": room_value,
+                "Position": position,
+                "Type": fields.get("Type", ""),
+                "QTY": fields.get("QTY", ""),
+                "Finish": fields.get("Finish", ""),
+                "Size": fields.get("Size", ""),
+                "Vendor": vendor,
+                "link_url": uri,
+                "link_text": title,
+                "Client Name": f"{tag_value.strip()} {fields.get('Type', '').strip()}".strip(),
+            })
 
     return pd.DataFrame(rows)
-
 
 # ========================= Tabs 2/3: Your Firecrawl + parsers =========================
 # --- Title normalization helper (keeps just the product name like 'Sawyer Chandelier') ---
@@ -924,32 +907,12 @@ with tab1:
     st.markdown("**Page → Tags table**")
     default_df = pd.DataFrame([{"page": "", "Tags": ""}])
     mapping_df = st.data_editor(
-        default_df,
-        num_rows="dynamic",
-        use_container_width=True,
-        key="page_tag_editor",
+        default_df, num_rows="dynamic", use_container_width=True, key="page_tag_editor",
         column_config={
             "page": st.column_config.TextColumn("page", help="Page number (1-based)"),
-            "Tags": st.column_config.TextColumn("Tags", help="Label for that page (Room name, space, etc.)"),
+            "Tags": st.column_config.TextColumn("Tags", help="Room name for that page"),
         }
     )
-
-    # --- View mode controls (Trade View / Room View) ---
-    col_view1, col_view2 = st.columns(2)
-    with col_view1:
-        trade_view = st.checkbox("Trade View", value=True)
-    with col_view2:
-        room_view = st.checkbox("Room View", value=False)
-
-    # Simple rule: if Room View is checked, use room mode; otherwise trade mode
-    if room_view:
-        view_mode = "room"
-    else:
-        view_mode = "trade"
-
-    # Store for use at extraction time
-    st.session_state["extract_view_mode"] = view_mode
-
     only_listed = st.checkbox("Only extract pages listed above", value=True)
     pad_px = st.slider("Link capture pad (pixels)", 0, 16, 4, 1)
     band_px = st.slider("Nearby text band (pixels)", 0, 60, 28, 2)
@@ -962,9 +925,6 @@ with tab1:
         on_click=_start_extract,
     )
 
-
-# Perform extraction after the UI is declared so button clicks set the flag first
-# Perform extraction after the UI is declared so button clicks set the flag first
 # Perform extraction after the UI is declared so button clicks set the flag first
 if st.session_state.get("pending_extract") and st.session_state.get("pdf_bytes") is not None:
     # Build mapping from editor
@@ -987,107 +947,47 @@ if st.session_state.get("pending_extract") and st.session_state.get("pdf_bytes")
         # If mapping_df isn't in scope (rare), just extract all pages without tags
         page_to_tag = {}
 
-    # Get view mode from session (default to trade if somehow unset)
-    view_mode = st.session_state.get("extract_view_mode", "trade")
-
     with st.spinner("Extracting links, positions & titles…"):
         df = extract_links_by_pages(
-            st.session_state["pdf_bytes"],
-            page_to_tag,
-            None,
+            st.session_state["pdf_bytes"], page_to_tag, None,
             only_listed_pages=only_listed,
             pad_px=pad_px,
-            band_px=band_px,
-            view_mode=view_mode,
+            band_px=band_px
         )
     st.session_state["extracted_df"] = df if not df.empty else None
     st.session_state["pending_extract"] = False
 
-
-# Always render editable table if we have data
 # Always render editable table if we have data
 if st.session_state.get("extracted_df") is not None:
-    st.caption("Edit the appropriate column per row, then click **Save room edits**. When you're done, download the CSV.")
+    st.caption("Edit the Room per row if needed, then click **Save room edits**. When you're done, download the CSV.")
 
     df_show = st.session_state["extracted_df"].copy()
-
-    # Ensure columns exist & are clean
     if "Room" not in df_show.columns:
         df_show["Room"] = ""
     df_show["Room"] = df_show["Room"].astype(str).fillna("").replace({"nan": ""})
 
-    if "Type" not in df_show.columns:
-        df_show["Type"] = ""
-    df_show["Type"] = df_show["Type"].astype(str).fillna("").replace({"nan": ""})
+    col_cfg = {
+        "Room": st.column_config.SelectboxColumn(
+            "Room",
+            options=ROOM_OPTIONS,
+            help="Choose a room/category or leave blank",
+        ),
+        "page": st.column_config.TextColumn("page", disabled=True),
+        "Tags": st.column_config.TextColumn("Tags", disabled=True),
+        "Position": st.column_config.TextColumn("Position", disabled=True),
+        "Type": st.column_config.TextColumn("Type", disabled=True),
+        "QTY": st.column_config.TextColumn("QTY", disabled=True),
+        "Finish": st.column_config.TextColumn("Finish", disabled=True),
+        "Size": st.column_config.TextColumn("Size", disabled=True),
+        "link_url": st.column_config.TextColumn("link_url", disabled=True),
+        "link_text": st.column_config.TextColumn("link_text", disabled=True),
+    }
 
-    if "Client Name" not in df_show.columns:
-        tags_col = df_show.get("Tags", "").astype(str).fillna("")
-        type_parsed_col = df_show.get("Type", "").astype(str).fillna("")
-        df_show["Client Name"] = (tags_col.str.strip() + " " + type_parsed_col.str.strip()).str.strip()
-
-    if "Vendor" not in df_show.columns:
-        df_show["Vendor"] = ""
-    df_show["Vendor"] = df_show["Vendor"].astype(str).fillna("").replace({"nan": ""})
-
-    # Determine current view mode
-    view_mode = st.session_state.get("extract_view_mode", "trade")
-
-    # In Room View:
-    #   - Room column = Tags (locked)
-    #   - Type column = dropdown with ROOM_OPTIONS
-    if view_mode == "room":
-        # If Room is empty, backfill from Tags (safety for older runs)
-        room_empty_mask = df_show["Room"].str.strip().eq("")
-        df_show.loc[room_empty_mask, "Room"] = df_show.loc[room_empty_mask, "Tags"]
-
-        col_cfg = {
-            "Room": st.column_config.TextColumn(
-                "Room",
-                disabled=True,
-                help="Room (taken from Tags in Room View)",
-            ),
-            "Type": st.column_config.SelectboxColumn(
-                "Type",
-                options=ROOM_OPTIONS,
-                help="Choose category/type (Lighting, Plumbing, etc.)",
-            ),
-            "page": st.column_config.TextColumn("page", disabled=True),
-            "Tags": st.column_config.TextColumn("Tags", disabled=True),
-            "Position": st.column_config.TextColumn("Position", disabled=True),
-            "QTY": st.column_config.TextColumn("QTY", disabled=True),
-            "Finish": st.column_config.TextColumn("Finish", disabled=True),
-            "Size": st.column_config.TextColumn("Size", disabled=True),
-            "Vendor": st.column_config.TextColumn("Vendor", disabled=True),
-            "Client Name": st.column_config.TextColumn("Client Name", disabled=True),
-            "link_url": st.column_config.TextColumn("link_url", disabled=True),
-            "link_text": st.column_config.TextColumn("link_text", disabled=True),
-        }
-    else:
-        # Trade View: original behavior
-        col_cfg = {
-            "Room": st.column_config.SelectboxColumn(
-                "Room",
-                options=ROOM_OPTIONS,
-                help="Choose a room/category or leave blank",
-            ),
-            "Type": st.column_config.TextColumn("Type", disabled=True),
-            "page": st.column_config.TextColumn("page", disabled=True),
-            "Tags": st.column_config.TextColumn("Tags", disabled=True),
-            "Position": st.column_config.TextColumn("Position", disabled=True),
-            "QTY": st.column_config.TextColumn("QTY", disabled=True),
-            "Finish": st.column_config.TextColumn("Finish", disabled=True),
-            "Size": st.column_config.TextColumn("Size", disabled=True),
-            "Vendor": st.column_config.TextColumn("Vendor", disabled=True),
-            "Client Name": st.column_config.TextColumn("Client Name", disabled=True),
-            "link_url": st.column_config.TextColumn("link_url", disabled=True),
-            "link_text": st.column_config.TextColumn("link_text", disabled=True),
-        }
-
-    # Single form + single editor, with unique keys
-    with st.form("room_editor_v2"):
+    # Edits apply only when you click Save — avoids partial reruns breaking choices
+    with st.form("room_editor"):
         edited_df = st.data_editor(
             df_show,
-            key="links_editor_v2",
+            key="links_editor",
             use_container_width=True,
             hide_index=True,
             num_rows="fixed",
@@ -1239,10 +1139,6 @@ with tab3:
         st.write("**Product title:**", title or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
-
-
-
-
 
 
 
