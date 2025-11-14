@@ -1005,6 +1005,7 @@ if st.session_state.get("pending_extract") and st.session_state.get("pdf_bytes")
 
 # Always render editable table if we have data
 # Always render editable table if we have data
+# Always render editable table if we have data
 if st.session_state.get("extracted_df") is not None:
     st.caption("Edit the appropriate column per row, then click **Save room edits**. When you're done, download the CSV.")
 
@@ -1024,10 +1025,14 @@ if st.session_state.get("extracted_df") is not None:
         type_parsed_col = df_show.get("Type", "").astype(str).fillna("")
         df_show["Client Name"] = (tags_col.str.strip() + " " + type_parsed_col.str.strip()).str.strip()
 
+    if "Vendor" not in df_show.columns:
+        df_show["Vendor"] = ""
+    df_show["Vendor"] = df_show["Vendor"].astype(str).fillna("").replace({"nan": ""})
+
     # Determine current view mode
     view_mode = st.session_state.get("extract_view_mode", "trade")
 
-    # In Room View, we want:
+    # In Room View:
     #   - Room column = Tags (locked)
     #   - Type column = dropdown with ROOM_OPTIONS
     if view_mode == "room":
@@ -1052,6 +1057,7 @@ if st.session_state.get("extracted_df") is not None:
             "QTY": st.column_config.TextColumn("QTY", disabled=True),
             "Finish": st.column_config.TextColumn("Finish", disabled=True),
             "Size": st.column_config.TextColumn("Size", disabled=True),
+            "Vendor": st.column_config.TextColumn("Vendor", disabled=True),
             "Client Name": st.column_config.TextColumn("Client Name", disabled=True),
             "link_url": st.column_config.TextColumn("link_url", disabled=True),
             "link_text": st.column_config.TextColumn("link_text", disabled=True),
@@ -1071,10 +1077,35 @@ if st.session_state.get("extracted_df") is not None:
             "QTY": st.column_config.TextColumn("QTY", disabled=True),
             "Finish": st.column_config.TextColumn("Finish", disabled=True),
             "Size": st.column_config.TextColumn("Size", disabled=True),
+            "Vendor": st.column_config.TextColumn("Vendor", disabled=True),
             "Client Name": st.column_config.TextColumn("Client Name", disabled=True),
             "link_url": st.column_config.TextColumn("link_url", disabled=True),
             "link_text": st.column_config.TextColumn("link_text", disabled=True),
         }
+
+    # NOTE: new, unique form key here: "room_editor_v2"
+    with st.form("room_editor_v2"):
+        edited_df = st.data_editor(
+            df_show,
+            key="links_editor",
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            column_config=col_cfg,
+        )
+        saved = st.form_submit_button("Save room edits", type="primary")
+
+    if saved:
+        st.session_state["extracted_df"] = edited_df
+        st.success("Room edits saved.")
+
+    st.download_button(
+        "Download CSV",
+        st.session_state["extracted_df"].to_csv(index=False).encode("utf-8"),
+        file_name="canva_links_with_position.csv",
+        mime="text/csv",
+    )
+
 
     # Edits apply only when you click Save — avoids partial reruns breaking choices
     with st.form("room_editor"):
@@ -1256,6 +1287,7 @@ with tab3:
         st.write("**Product title:**", title or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
 
 
 
