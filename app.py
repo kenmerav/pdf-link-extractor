@@ -363,7 +363,7 @@ rows.append({
     "Vendor": _vendor_from_url(uri),
 })
 
-return pd.DataFrame(rows)
+    return pd.DataFrame(rows)
 
 
 # ========================= Tabs 2/3: Your Firecrawl + parsers =========================
@@ -1140,6 +1140,7 @@ with tab3:
         st.write("**Product title:**", title or "—")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
+
 
 
 
