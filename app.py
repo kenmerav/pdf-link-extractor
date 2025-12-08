@@ -188,6 +188,9 @@ def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 
       2) If empty, look in a thin horizontal band that overlaps X with the rect.
       3) Expand to include *all words on the same (block,line)* as any kept word.
       4) As a final fallback, use page.get_textbox(rect).
+    
+    IMPORTANT: We require at least one word to be found within the link rectangle itself
+    (not just nearby) to prevent associating links with unrelated adjacent text.
     """
     import fitz
     if not rect:
@@ -198,6 +201,8 @@ def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 
     # words: [x0,y0,x1,y1,word,block,line,word_no]
     words = page.get_text("words") or []
 
+    # First, find words directly within the link rectangle
+    kept_in_rect = []  # Words actually in the link rect
     kept = []  # (y0, x0, word, block, line)
     for x0, y0, x1, y1, w, b, ln, *_ in words:
         if not w:
@@ -205,10 +210,12 @@ def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 
         cx = (x0 + x1) / 2.0
         cy = (y0 + y1) / 2.0
         if R.contains(fitz.Point(cx, cy)):
+            kept_in_rect.append((y0, x0, w, b, ln))
             kept.append((y0, x0, w, b, ln))
 
-    if not kept:
-        # band fallback: same Y ± band, with X overlap
+    # If no words found directly in the link rectangle, try band fallback
+    if not kept_in_rect:
+        # band fallback: same Y ± band, with X overlap (stricter)
         band = fitz.Rect(r.x0, r.y0 - band_px, r.x1, r.y1 + band_px)
         for x0, y0, x1, y1, w, b, ln, *_ in words:
             if not w:
@@ -217,6 +224,12 @@ def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 
             x_overlaps = not (x1 < r.x0 or x0 > r.x1)
             if cy_in and x_overlaps:
                 kept.append((y0, x0, w, b, ln))
+                kept_in_rect.append((y0, x0, w, b, ln))  # Count band matches as "in rect" for this check
+
+    # Require that at least one word was found within or very close to the link rectangle
+    # This prevents pulling text from completely unrelated areas
+    if not kept_in_rect:
+        return ""  # No text associated with this link - return empty to skip it
 
     if kept:
         # Expand to the full (block,line) of the kept word(s). Prefer the line with the most words.
@@ -226,9 +239,33 @@ def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 
             counts[key] = counts.get(key, 0) + 1
         best_key = max(counts.items(), key=lambda kv: kv[1])[0]
         bx, lx = best_key
-        line_words = [(y0, x0, w) for x0, y0, x1, y1, w, b, ln, *_ in words if b == bx and ln == lx and w]
-        line_words.sort(key=lambda t: (round(t[0], 3), t[1]))
-        text = " ".join(t[2] for t in line_words).strip()
+        
+        # Get all words on this line and calculate bounding box
+        line_word_data = [(x0, y0, x1, y1, w) for x0, y0, x1, y1, w, b, ln, *_ in words if b == bx and ln == lx and w]
+        
+        if line_word_data:
+            # Calculate the bounding box of the extracted text
+            text_x_min = min(x0 for x0, y0, x1, y1, w in line_word_data)
+            text_x_max = max(x1 for x0, y0, x1, y1, w in line_word_data)
+            text_y_min = min(y0 for x0, y0, x1, y1, w in line_word_data)
+            text_y_max = max(y1 for x0, y0, x1, y1, w in line_word_data)
+            
+            # Check if link rectangle overlaps with text bounding box (with some tolerance)
+            # If the link is too far from the text, it's probably not associated with it
+            tolerance = 50  # pixels
+            link_overlaps_text = not (r.x1 + tolerance < text_x_min or r.x0 - tolerance > text_x_max or 
+                                      r.y1 + tolerance < text_y_min or r.y0 - tolerance > text_y_max)
+            
+            if not link_overlaps_text:
+                # Link rectangle doesn't overlap with extracted text - probably wrong association
+                return ""
+            
+            # Sort and extract text
+            line_words = [(y0, x0, w) for x0, y0, x1, y1, w in line_word_data]
+            line_words.sort(key=lambda t: (round(t[0], 3), t[1]))
+            text = " ".join(t[2] for t in line_words).strip()
+        else:
+            text = ""
     else:
         text = ""
 
@@ -273,6 +310,134 @@ ROOM_MAP_RAW = [
 
 ROOM_MAP: Dict[str, str] = {k.lower(): v for (k, v) in ROOM_MAP_RAW}
 ROOM_OPTIONS = ["", "LIGHTING", "PLUMBING", "PAINT", "COUNTERTOPS + SLABS", "CABINETRY FINISHES", "HARDWARE", "TILE + STONE", "ACCENT MIRRORS", "DOORS, BASE, CASE", "WALLCOVERING", "APPLIANCES"]
+
+# Type-to-Room mapping (hardcoded list from user)
+TYPE_TO_ROOM_MAP_RAW = [
+    # ACCENT MIRRORS
+    ("MIRRORS", "ACCENT MIRRORS"),
+    ("MIRROR", "ACCENT MIRRORS"),
+    
+    # COUNTERTOPS + SLABS
+    ("COUNTERTOP", "COUNTERTOPS + SLABS"),
+    ("PRO STORM QUARTZ", "COUNTERTOPS + SLABS"),
+    ("COUNTERTOP + INSTALL", "COUNTERTOPS + SLABS"),
+    ("SLAB", "COUNTERTOPS + SLABS"),
+    ("BACKSPLASH", "COUNTERTOPS + SLABS"),
+    ("COUNTERTOP INSTALL", "COUNTERTOPS + SLABS"),
+    ("COUNTERTOP + FAB", "COUNTERTOPS + SLABS"),
+    ("WATERFALL PANEL", "COUNTERTOPS + SLABS"),
+    ("QUARTZITE", "COUNTERTOPS + SLABS"),
+    
+    # DOORS, BASE, CASE
+    ("INTERIOR DOORS", "DOORS, BASE, CASE"),
+    ("INTERIOR DOOR HINGES", "DOORS, BASE, CASE"),
+    ("INTERIOR DOOR STOPS", "DOORS, BASE, CASE"),
+    ("CASING", "DOORS, BASE, CASE"),
+    ("INTERIOR DOOR HANDLES", "DOORS, BASE, CASE"),
+    ("BASEBOARDS", "DOORS, BASE, CASE"),
+    
+    # HARDWARE
+    ("HARDWARE", "HARDWARE"),
+    ("APPLIANCE HARDWARE", "HARDWARE"),
+    ("CABINETRY HARDWARE", "HARDWARE"),
+    ("DOOR HARDWARE", "HARDWARE"),
+    ("PULL", "HARDWARE"),
+    ("KNOBS", "HARDWARE"),
+    ("PULLS", "HARDWARE"),
+    ("HANDLESET", "HARDWARE"),
+    ("ENTRY SET", "HARDWARE"),
+    ("TOWEL HOOKS", "HARDWARE"),
+    
+    # LIGHTING
+    ("BEDROOM FANS", "LIGHTING"),
+    ("CHANDELIER", "LIGHTING"),
+    ("SCONCES", "LIGHTING"),
+    ("PENDANT", "LIGHTING"),
+    ("PENDANTS", "LIGHTING"),
+    ("FAN", "LIGHTING"),
+    ("FLUSH MOUNT", "LIGHTING"),
+    ("SEMI-FLUSH", "LIGHTING"),
+    ("WALL LAMP", "LIGHTING"),
+    ("VANITY LIGHT", "LIGHTING"),
+    ("ACCENT LIGHTING", "LIGHTING"),
+    
+    # PAINT
+    ("INTERIOR PAINT", "PAINT"),
+    ("LIMEWASH CEILING", "PAINT"),
+    ("ALL OVER LIMEWASH", "PAINT"),
+    ("TRIM PAINT", "PAINT"),
+    ("WALL PAINT", "PAINT"),
+    ("CEILING PAINT", "PAINT"),
+    ("CABINETRY FINISHES", "PAINT"),
+    
+    # PLUMBING
+    ("SINK FAUCET", "PLUMBING"),
+    ("SINK FLANGE", "PLUMBING"),
+    ("SINK", "PLUMBING"),
+    ("SINK STRAINER", "PLUMBING"),
+    ("POT FILLER", "PLUMBING"),
+    ("TOILET", "PLUMBING"),
+    ("BATHTUB", "PLUMBING"),
+    ("TUB FILLER", "PLUMBING"),
+    ("SHOWER SYSTEM", "PLUMBING"),
+    ("HANDHELD SHOWER", "PLUMBING"),
+    ("DRAIN", "PLUMBING"),
+    ("TRIM KIT", "PLUMBING"),
+    ("SPOUT", "PLUMBING"),
+    ("VALVE TRIM", "PLUMBING"),
+    ("SHOWER SPRAYERS", "PLUMBING"),
+    ("SHOWER DRAIN", "PLUMBING"),
+    ("TUB", "PLUMBING"),
+    
+    # TILE + STONE
+    ("LVP", "TILE + STONE"),
+    ("TUMBLED LIMESTONE", "TILE + STONE"),
+    ("FLOORING", "TILE + STONE"),
+    ("STONE WALL", "TILE + STONE"),
+    ("MOSAIC", "TILE + STONE"),
+    ("TILE", "TILE + STONE"),
+    ("FLOOR TILE", "TILE + STONE"),
+    ("WALL TILE", "TILE + STONE"),
+    ("GROUT", "TILE + STONE"),
+    ("THRESHOLD", "TILE + STONE"),
+    ("TRIM PIECES", "TILE + STONE"),
+    ("SHOWER PAN TILE", "TILE + STONE"),
+    ("SHOWER WALLS + CURB TILE", "TILE + STONE"),
+    ("SHOWER FLOOR TILE", "TILE + STONE"),
+    ("ALL OVER FLOORING TILE", "TILE + STONE"),
+    ("UPPER SHOWER TILE", "TILE + STONE"),
+    ("CURB TILE", "TILE + STONE"),
+    
+    # WALLCOVERING
+    ("WALLCOVERING", "WALLCOVERING"),
+    ("WALLPAPER", "WALLCOVERING"),
+    ("CEILING AND ALL OVER WALLPAPER", "WALLCOVERING"),
+    ("VINYL WALLCOVERING", "WALLCOVERING"),
+]
+
+def _infer_room_from_type(type_val: str, type_to_room_map: Optional[Dict[str, str]] = None) -> str:
+    """
+    Given a 'Type' value (ex: "Pendant" / "Sink" / etc.), return the mapped Room.
+    Uses the type_to_room_map if provided, otherwise uses default mapping.
+    Strategy: exact lowercase match, then longest prefix match. Fallback: "" (blank)
+    """
+    if not type_val:
+        return ""
+    
+    # Use provided map or default empty map
+    if type_to_room_map is None:
+        type_to_room_map = {}
+    
+    t = type_val.strip().lower()
+    if t in type_to_room_map:
+        return type_to_room_map[t]
+    
+    # Try longest prefix match
+    best_key = ""
+    for k in type_to_room_map.keys():
+        if t.startswith(k) and len(k) > len(best_key):
+            best_key = k
+    return type_to_room_map.get(best_key, "")
 
 def _infer_room_from_tag(tag_val: str) -> str:
     """
@@ -323,10 +488,16 @@ def extract_links_by_pages(
     pad_px: float = 4.0,
     band_px: float = 28.0,
     view_mode: str = "trade",  # "trade" (old behavior) or "room"
+    dedupe_by: str = "url_and_position",  # "url_and_position", "url_only", or "none"
+    type_to_room_map: Optional[Dict[str, str]] = None,  # Map of type -> room for auto-filling
 ) -> pd.DataFrame:
     doc = fitz.open("pdf", pdf_bytes)
     rows = []
     listed = set(page_to_tag.keys()) if page_to_tag else set()
+    
+    # Deduplication tracking
+    seen = set()  # Track (page, canonical_url, position) or (page, canonical_url) depending on dedupe_by
+    duplicates_skipped = 0  # Count of duplicates removed
 
     for pidx, page in enumerate(doc, start=1):
         if only_listed_pages and page_to_tag and pidx not in listed:
@@ -335,24 +506,77 @@ def extract_links_by_pages(
         tag_value = (page_to_tag or {}).get(pidx, "")
         room_value = (page_to_room or {}).get(pidx, _infer_room_from_tag(tag_value))
 
+        # Get page dimensions to exclude top-right region (where titles are)
+        page_rect = page.rect
+        page_width = page_rect.width
+        page_height = page_rect.height
+        top_right_x_min = page_width * 0.6  # Right 40%
+        top_right_y_max = page_height * 0.25  # Top 25%
+
+        # Build a map of link rectangles to URLs for this page
+        # This allows us to check if a text block has an associated link
+        link_rects = []  # List of (rect, uri) tuples
+        
+        # Process all links (existing behavior - items with links)
+        processed_rects = []  # Track which link rects we've processed (as Rect objects)
+        
         for lnk in page.get_links():
             uri = (lnk.get("uri") or "").strip()
             if not uri.lower().startswith(("http://", "https://")):
                 continue
 
+            # Canonicalize URL for deduplication
+            canonical_uri = canonicalize_url(uri)
+
             rect = lnk.get("from")
+            if not rect:
+                continue
+                
+            r = fitz.Rect(rect).normalize()
+            
+            # Skip links in top-right region (where page titles are)
+            link_center_x = (r.x0 + r.x1) / 2.0
+            link_center_y = (r.y0 + r.y1) / 2.0
+            if link_center_x >= top_right_x_min and link_center_y <= top_right_y_max:
+                continue  # Skip top-right region
+            
+            processed_rects.append(r)
+            link_rects.append((r, uri))
+            
             raw = extract_link_title_strict(page, rect, pad_px=pad_px, band_px=band_px)
             position, title = split_position_and_title_start(raw)
+
+            # Require that at least some text is actually within the link rectangle
+            # This prevents associating links with nearby unrelated text
+            if not raw:
+                # No text found for this link - skip it to avoid false associations
+                continue
 
             # Ignore common headings like "MATERIALS LIST"
             if not title or title.strip().lower().startswith(("materials list", "material list")):
                 continue
 
+            # Deduplication check
+            if dedupe_by == "url_and_position":
+                dedupe_key = (pidx, canonical_uri, position)
+            elif dedupe_by == "url_only":
+                dedupe_key = (pidx, canonical_uri)
+            else:  # "none"
+                dedupe_key = None
+            
+            if dedupe_key and dedupe_key in seen:
+                duplicates_skipped += 1
+                continue  # Skip duplicate
+            
+            if dedupe_key:
+                seen.add(dedupe_key)
+
             fields = parse_link_title_fields(title)
+            type_col = fields.get("Type", "")
 
             # --- View-mode mapping logic ---
             # Trade View (existing behavior):
-            #   Room  = room_value (inferred / dropdown)
+            #   Room  = room_value (inferred / dropdown), but auto-fill from Type if available
             #   Type  = parsed from link text (fields["Type"])
             #
             # Room View (new behavior):
@@ -360,10 +584,10 @@ def extract_links_by_pages(
             #   Type  = parsed from link text initially; you will overwrite via dropdown in UI
             if view_mode == "room":
                 room_col = tag_value
-                type_col = fields.get("Type", "")
             else:
-                room_col = room_value
-                type_col = fields.get("Type", "")
+                # Try to auto-fill Room from Type first, then fall back to room_value
+                room_from_type = _infer_room_from_type(type_col, type_to_room_map)
+                room_col = room_from_type if room_from_type else room_value
 
             rows.append({
                 "page": pidx,
@@ -379,15 +603,81 @@ def extract_links_by_pages(
                 "Client Name": f"{tag_value.strip()} {fields.get('Type', '').strip()}".strip(),
                 "Vendor": _vendor_from_url(uri),
             })
+        
+        # Now process text blocks that don't have links
+        # Get text blocks and check if they overlap with any link rectangle
+        blocks = page.get_text("blocks")
+        for block in blocks:
+            if block[6] != 0:  # block type 0 is text, others are images
+                continue
+            
+            block_rect = fitz.Rect(block[0:4])  # x0, y0, x1, y1
+            block_text = block[4].strip()  # text content
+            
+            # Skip text in top-right region (where page titles are)
+            block_center_x = (block_rect.x0 + block_rect.x1) / 2.0
+            block_center_y = (block_rect.y0 + block_rect.y1) / 2.0
+            if block_center_x >= top_right_x_min and block_center_y <= top_right_y_max:
+                continue  # Skip top-right region
+            
+            # Skip if this block overlaps with a link we already processed
+            overlaps_link = False
+            for link_rect in processed_rects:
+                try:
+                    if block_rect.intersects(link_rect):
+                        overlaps_link = True
+                        break
+                except Exception:
+                    # If intersection check fails, assume no overlap
+                    pass
+            
+            if overlaps_link or not block_text:
+                continue
+            
+            # Skip common headings
+            if block_text.lower().startswith(("materials list", "material list")):
+                continue
+            
+            # This is a text block without a link - extract it with blank URL
+            position, title = split_position_and_title_start(block_text)
+            
+            # Skip if no meaningful title
+            if not title:
+                continue
+            
+            fields = parse_link_title_fields(title)
+            type_col = fields.get("Type", "")
+            
+            if view_mode == "room":
+                room_col = tag_value
+            else:
+                # Try to auto-fill Room from Type first, then fall back to room_value
+                room_from_type = _infer_room_from_type(type_col, type_to_room_map)
+                room_col = room_from_type if room_from_type else room_value
+            
+            rows.append({
+                "page": pidx,
+                "Tags": tag_value,
+                "Room": room_col,
+                "Position": position,
+                "Type": type_col,
+                "QTY": fields.get("QTY", ""),
+                "Finish": fields.get("Finish", ""),
+                "Size": fields.get("Size", ""),
+                "link_url": "",  # Blank since no link
+                "link_text": title,
+                "Client Name": f"{tag_value.strip()} {fields.get('Type', '').strip()}".strip(),
+                "Vendor": "",
+            })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), duplicates_skipped
 
 
 # ========================= Tabs 2/3: Your Firecrawl + parsers =========================
 # --- Title normalization helper (keeps just the product name like 'Sawyer Chandelier') ---
 from urllib.parse import urlparse as _urlparse_for_title
 
-def normalize_product_title(raw: str, url: str | None = None) -> str:
+def normalize_product_title(raw: str, url: Optional[str] = None) -> str:
     if not raw:
         return ""
     t = str(raw).strip()
@@ -934,6 +1224,25 @@ with tab1:
     only_listed = st.checkbox("Only extract pages listed above", value=True)
     pad_px = st.slider("Link capture pad (pixels)", 0, 16, 4, 1)
     band_px = st.slider("Nearby text band (pixels)", 0, 60, 28, 2)
+    
+    dedupe_mode = st.selectbox(
+        "Deduplication mode",
+        options=["url_and_position", "url_only", "none"],
+        index=0,
+        format_func=lambda x: {
+            "url_and_position": "Remove duplicates: same URL + same position on same page (recommended)",
+            "url_only": "Remove duplicates: same URL on same page (keeps different positions)",
+            "none": "No deduplication (keep all links)"
+        }[x],
+        help="Choose how to handle duplicate links. 'url_and_position' is recommended to remove true duplicates while preserving legitimate multiple occurrences.",
+        key="dedupe_mode_select"
+    )
+    # Store in session state for use in extraction
+    st.session_state["dedupe_mode"] = dedupe_mode
+
+    # Initialize type-to-room mapping in session state (hardcoded list)
+    if "type_to_room_map" not in st.session_state:
+        st.session_state["type_to_room_map"] = {k.lower(): v for k, v in TYPE_TO_ROOM_MAP_RAW}
 
     st.button(
         "Extract",
@@ -943,86 +1252,99 @@ with tab1:
         on_click=_start_extract,
     )
 
-# Perform extraction after the UI is declared so button clicks set the flag first
-if st.session_state.get("pending_extract") and st.session_state.get("pdf_bytes") is not None:
-    # Build mapping from editor
-    page_to_tag: Dict[int, str] = {}
-    num_pages = st.session_state.get("num_pages")
-    try:
-        # mapping_df is defined in the same script run; guard if not
-        for _, row in mapping_df.iterrows():
-            p_raw = str(row.get("page", "")).strip()
-            t_raw = str(row.get("Tags", "")).strip()
-            if not p_raw:
-                continue
-            try:
-                p_no = int(p_raw)
-                if p_no >= 1 and (num_pages is None or p_no <= num_pages):
-                    page_to_tag[p_no] = t_raw
-            except Exception:
-                continue
-    except NameError:
-        # If mapping_df isn't in scope (rare), just extract all pages without tags
-        page_to_tag = {}
+    # Perform extraction after the UI is declared so button clicks set the flag first
+    if st.session_state.get("pending_extract") and st.session_state.get("pdf_bytes") is not None:
+        # Build mapping from editor
+        page_to_tag: Dict[int, str] = {}
+        num_pages = st.session_state.get("num_pages")
+        try:
+            # mapping_df is defined in the same script run; guard if not
+            for _, row in mapping_df.iterrows():
+                p_raw = str(row.get("page", "")).strip()
+                t_raw = str(row.get("Tags", "")).strip()
+                if not p_raw:
+                    continue
+                try:
+                    p_no = int(p_raw)
+                    if p_no >= 1 and (num_pages is None or p_no <= num_pages):
+                        page_to_tag[p_no] = t_raw
+                except Exception:
+                    continue
+        except NameError:
+            # If mapping_df isn't in scope (rare), just extract all pages without tags
+            page_to_tag = {}
 
-    with st.spinner("Extracting links, positions & titles…"):
-        df = extract_links_by_pages(
-            st.session_state["pdf_bytes"], page_to_tag, None,
-            only_listed_pages=only_listed,
-            pad_px=pad_px,
-            band_px=band_px
+        with st.spinner("Extracting links, positions & titles…"):
+            # Get dedupe_mode from session state (set by selectbox above)
+            dedupe_mode_value = st.session_state.get("dedupe_mode", "url_and_position")
+            # Get type-to-room mapping from session state
+            type_to_room_map_value = st.session_state.get("type_to_room_map", {})
+            
+            df, duplicates_skipped = extract_links_by_pages(
+                st.session_state["pdf_bytes"], page_to_tag, None,
+                only_listed_pages=only_listed,
+                pad_px=pad_px,
+                band_px=band_px,
+                dedupe_by=dedupe_mode_value,
+                type_to_room_map=type_to_room_map_value
+            )
+        st.session_state["extracted_df"] = df if not df.empty else None
+        st.session_state["pending_extract"] = False
+        
+        # Show duplicate removal feedback
+        if duplicates_skipped > 0:
+            st.info(f"✅ Removed {duplicates_skipped} duplicate link(s) during extraction. Extracted {len(df)} unique link(s).")
+        elif dedupe_mode_value != "none":
+            st.success(f"✅ Extracted {len(df)} unique link(s).")
+
+    # Always render editable table if we have data (only in Tab 1)
+    if st.session_state.get("extracted_df") is not None:
+        st.caption("Edit the Room per row if needed, then click **Save room edits**. When you're done, download the CSV.")
+
+        df_show = st.session_state["extracted_df"].copy()
+        if "Room" not in df_show.columns:
+            df_show["Room"] = ""
+        df_show["Room"] = df_show["Room"].astype(str).fillna("").replace({"nan": ""})
+
+        col_cfg = {
+            "Room": st.column_config.SelectboxColumn(
+                "Room",
+                options=ROOM_OPTIONS,
+                help="Choose a room/category or leave blank",
+            ),
+            "page": st.column_config.TextColumn("page", disabled=True),
+            "Tags": st.column_config.TextColumn("Tags", disabled=True),
+            "Position": st.column_config.TextColumn("Position", disabled=True),
+            "Type": st.column_config.TextColumn("Type", disabled=True),
+            "QTY": st.column_config.TextColumn("QTY", disabled=True),
+            "Finish": st.column_config.TextColumn("Finish", disabled=True),
+            "Size": st.column_config.TextColumn("Size", disabled=True),
+            "link_url": st.column_config.TextColumn("link_url", disabled=True),
+            "link_text": st.column_config.TextColumn("link_text", disabled=True),
+        }
+
+        # Edits apply only when you click Save — avoids partial reruns breaking choices
+        with st.form("room_editor"):
+            edited_df = st.data_editor(
+                df_show,
+                key="links_editor",
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                column_config=col_cfg,
+            )
+            saved = st.form_submit_button("Save room edits", type="primary")
+
+        if saved:
+            st.session_state["extracted_df"] = edited_df
+            st.success("Room edits saved.")
+
+        st.download_button(
+            "Download CSV",
+            st.session_state["extracted_df"].to_csv(index=False).encode("utf-8"),
+            file_name="canva_links_with_position.csv",
+            mime="text/csv",
         )
-    st.session_state["extracted_df"] = df if not df.empty else None
-    st.session_state["pending_extract"] = False
-
-# Always render editable table if we have data
-if st.session_state.get("extracted_df") is not None:
-    st.caption("Edit the Room per row if needed, then click **Save room edits**. When you're done, download the CSV.")
-
-    df_show = st.session_state["extracted_df"].copy()
-    if "Room" not in df_show.columns:
-        df_show["Room"] = ""
-    df_show["Room"] = df_show["Room"].astype(str).fillna("").replace({"nan": ""})
-
-    col_cfg = {
-        "Room": st.column_config.SelectboxColumn(
-            "Room",
-            options=ROOM_OPTIONS,
-            help="Choose a room/category or leave blank",
-        ),
-        "page": st.column_config.TextColumn("page", disabled=True),
-        "Tags": st.column_config.TextColumn("Tags", disabled=True),
-        "Position": st.column_config.TextColumn("Position", disabled=True),
-        "Type": st.column_config.TextColumn("Type", disabled=True),
-        "QTY": st.column_config.TextColumn("QTY", disabled=True),
-        "Finish": st.column_config.TextColumn("Finish", disabled=True),
-        "Size": st.column_config.TextColumn("Size", disabled=True),
-        "link_url": st.column_config.TextColumn("link_url", disabled=True),
-        "link_text": st.column_config.TextColumn("link_text", disabled=True),
-    }
-
-    # Edits apply only when you click Save — avoids partial reruns breaking choices
-    with st.form("room_editor"):
-        edited_df = st.data_editor(
-            df_show,
-            key="links_editor",
-            use_container_width=True,
-            hide_index=True,
-            num_rows="fixed",
-            column_config=col_cfg,
-        )
-        saved = st.form_submit_button("Save room edits", type="primary")
-
-    if saved:
-        st.session_state["extracted_df"] = edited_df
-        st.success("Room edits saved.")
-
-    st.download_button(
-        "Download CSV",
-        st.session_state["extracted_df"].to_csv(index=False).encode("utf-8"),
-        file_name="canva_links_with_position.csv",
-        mime="text/csv",
-    )
 
 # --- Tab 2: Enrich CSV (your version preserved) ---
 with tab2:
