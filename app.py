@@ -785,8 +785,8 @@ def pick_image_and_price_bs4(html: str, base_url: str) -> Tuple[str, str, str]:
             except Exception:
                 pass
     if not img_url:
-        anyimg = soup.find("img", src=True)
-        if anyimg: img_url = urljoin(base_url, anyimg["src"])
+        # Use broader HTML scan (srcset + lazyload)
+        img_url = _first_image_from_html(html, base_url)
 
     price = ""
     for tag in soup.find_all("script", type="application/ld+json"):
@@ -840,6 +840,52 @@ def _largest_from_srcset(srcset_value: str) -> str:
         if w > best_w:
             best_w, best_url = w, url
     return best_url
+
+def _first_image_from_html(html: str, base_url: str = "") -> str:
+    """
+    Best-effort image extraction from HTML:
+    - prefer <picture><source srcset> largest width
+    - then <img> with srcset/data-srcset (largest)
+    - then common lazyload attrs (data-zoom-image, data-large_image, data-original, data-src, data-lazy)
+    - then plain src
+    """
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "lxml")
+    candidates = []
+
+    def _add(url_val: str):
+        if isinstance(url_val, str) and url_val.strip():
+            candidates.append(urljoin(base_url, url_val.strip()))
+
+    def _pick_srcset(val: str):
+        cand = _largest_from_srcset(val)
+        if cand:
+            _add(cand)
+
+    # <picture> sources first
+    for pict in soup.find_all("picture"):
+        for src in pict.find_all("source"):
+            for attr in ("srcset", "data-srcset"):
+                v = src.get(attr)
+                if isinstance(v, str) and v.strip():
+                    _pick_srcset(v)
+    # <img> tags: srcset then lazy attrs
+    for im in soup.find_all("img"):
+        for attr in ("srcset", "data-srcset"):
+            v = im.get(attr)
+            if isinstance(v, str) and v.strip():
+                _pick_srcset(v)
+        for attr in ("data-zoom-image", "data-large_image", "data-original", "data-src", "data-lazy", "src"):
+            v = im.get(attr)
+            if isinstance(v, str) and v.strip():
+                _add(v)
+    # preload hints
+    preload = soup.find("link", rel=lambda v: v and "preload" in v, attrs={"as": "image"})
+    if preload and isinstance(preload.get("href"), str):
+        _add(preload["href"])
+
+    return candidates[0] if candidates else ""
 
 def _first_lumens_pdp_large_from_html(html: str) -> str:
     if not html: return ""
@@ -962,6 +1008,16 @@ def firecrawl_scrape_v2(url: str, api_key: str, mode: str = "simple") -> dict:
             {"type": "scroll", "y": 1200},
             {"type": "wait", "milliseconds": 1200},
         ]
+    elif mode == "full":
+        payload["actions"] = [
+            {"type": "wait", "milliseconds": 1200},
+            {"type": "scroll", "y": 2000},
+            {"type": "wait", "milliseconds": 1800},
+            {"type": "scroll", "y": 4000},
+            {"type": "wait", "milliseconds": 1800},
+            {"type": "scroll", "y": 6000},
+            {"type": "wait", "milliseconds": 2000},
+        ]
 
     try:
         r = requests.post(
@@ -975,7 +1031,7 @@ def firecrawl_scrape_v2(url: str, api_key: str, mode: str = "simple") -> dict:
     except Exception:
         return {}
 
-def parse_image_and_price_from_v2_generic(scrape: dict) -> Tuple[str, str, str]:
+def parse_image_and_price_from_v2_generic(scrape: dict, base_url: str = "") -> Tuple[str, str, str]:
     """Generic Firecrawl parse: OG/Twitter/meta + JSON-LD + visible + title.
     Ensures scalar strings are returned (not lists/dicts) to keep DataFrame columns homogenous.
     """
@@ -986,6 +1042,9 @@ def parse_image_and_price_from_v2_generic(scrape: dict) -> Tuple[str, str, str]:
 
     img = meta.get("og:image") or meta.get("twitter:image") or meta.get("image") or ""
     img = _first_scalar(img)
+    # If no image from meta, try to parse HTML for lazy-loaded/srcset images
+    if (not img) and html:
+        img = _first_image_from_html(html, base_url)
     price = ""
     if html:
         soup = BeautifulSoup(html or "", "lxml")
@@ -1014,16 +1073,25 @@ def parse_image_and_price_from_v2_generic(scrape: dict) -> Tuple[str, str, str]:
 
 def enrich_domain_firecrawl_v2(url: str, api_key: str) -> Tuple[str, str, str, str]:
     sc = firecrawl_scrape_v2(url, api_key, mode="simple")
-    img, price, title = parse_image_and_price_from_v2_generic(sc)
+    img, price, title = parse_image_and_price_from_v2_generic(sc, url)
     title = normalize_product_title(title, url)
     status = "firecrawl_v2_simple"
     if not img or not price or not title:
         sc2 = firecrawl_scrape_v2(url, api_key, mode="gentle")
-        i2, p2, t2 = parse_image_and_price_from_v2_generic(sc2)
+        i2, p2, t2 = parse_image_and_price_from_v2_generic(sc2, url)
         img = img or i2
         price = price or p2
         title = title or normalize_product_title(t2, url)
         status = "firecrawl_v2_gentle" if (i2 or p2 or t2) else status
+    # Final deep scrape with more scrolling/waiting if still missing pieces
+    if (not img or not price or not title) and api_key:
+        sc3 = firecrawl_scrape_v2(url, api_key, mode="full")
+        i3, p3, t3 = parse_image_and_price_from_v2_generic(sc3, url)
+        if i3 or p3 or t3:
+            img = img or i3
+            price = price or p3
+            title = title or normalize_product_title(t3, url)
+            status = "firecrawl_v2_full"
     return img, price, title, status
 
 def enrich_wayfair_v2(url: str, api_key: str) -> Tuple[str, str, str, str]:
@@ -1045,6 +1113,14 @@ def enrich_lumens_v2(url: str, api_key: str) -> Tuple[str, str, str, str]:
         price = price or p2
         title = title or normalize_product_title(t2, u)
         status = "firecrawl_v2_gentle" if (i2 or p2 or t2) else status
+    if (not img or not price or not title) and api_key:
+        sc3 = firecrawl_scrape_v2(u, api_key, mode="full")
+        i3, p3, t3 = parse_image_and_price_lumens_from_v2(sc3)
+        if i3 or p3 or t3:
+            img = img or i3
+            price = price or p3
+            title = title or normalize_product_title(t3, u)
+            status = "firecrawl_v2_full"
     return img, price, title, status
 
 # ----------------- Bulk Enrichment (chunked + resume) -----------------
