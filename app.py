@@ -119,7 +119,7 @@ def _normalize_separators(s: str) -> str:
     return s.strip()
 
 def parse_link_title_fields(link_text: str) -> Dict[str, str]:
-    fields: Dict[str, str] = {"Type": "", "QTY": "", "Finish": "", "Size": ""}
+    fields: Dict[str, str] = {"Type": "", "Quantity": "", "Finish/Color": "", "Dimensions": ""}
     s = _normalize_separators(link_text)
     if not s:
         return fields
@@ -135,18 +135,18 @@ def parse_link_title_fields(link_text: str) -> Dict[str, str]:
         if m and not fields["Type"]:
             fields["Type"] = m.group(1).strip(); continue
         m = QTY_RE.search(tok)
-        if m and not fields["QTY"]:
+        if m and not fields["Quantity"]:
             q_raw = m.group(1).strip()
             q_norm = _normalize_qty_token(q_raw)
             if q_norm:
-                fields["QTY"] = q_norm
+                fields["Quantity"] = q_norm
             else:
                 q_up = q_raw.upper()
-                fields["QTY"] = "" if q_up == "XX" else q_up
+                fields["Quantity"] = "" if q_up == "XX" else q_up
             continue
 
         # Fallback: handle cases like "QTY: TWO" or "Quantity - THREE" when regex didn't catch digits
-        if not fields["QTY"] and ("QTY" in tok.upper() or "QUANTITY" in tok.upper()):
+        if not fields["Quantity"] and ("QTY" in tok.upper() or "QUANTITY" in tok.upper()):
             after = tok
             if ":" in tok:
                 after = tok.split(":", 1)[1]
@@ -155,17 +155,17 @@ def parse_link_title_fields(link_text: str) -> Dict[str, str]:
             word = after.strip().split()[0] if after.strip() else ""
             q_norm = _normalize_qty_token(word)
             if q_norm:
-                fields["QTY"] = q_norm
+                fields["Quantity"] = q_norm
                 continue
         m = FINISH_RE.search(tok)
-        if m and not fields["Finish"]:
-            fields["Finish"] = m.group(1).strip(); continue
+        if m and not fields["Finish/Color"]:
+            fields["Finish/Color"] = m.group(1).strip(); continue
         m = SIZE_RE.search(tok)
-        if m and not fields["Size"]:
+        if m and not fields["Dimensions"]:
             size_val = m.group(1).strip()
             size_val = size_val.replace("”", '"').replace("“", '"').replace("’", "'").replace("‘", "'")
             size_val = re.sub(r"\s*[xX]\s*", " x ", size_val)
-            fields["Size"] = size_val.strip(); continue
+            fields["Dimensions"] = size_val.strip(); continue
 
     # If Type was unlabeled (e.g., "PENDANTS | QTY: 2 | ..."), infer from first unlabeled token
     if not fields["Type"]:
@@ -178,19 +178,19 @@ def parse_link_title_fields(link_text: str) -> Dict[str, str]:
 
     return fields
 
-def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 28.0) -> str:
+def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 28.0):
     """
     STRICT per-link capture but expanded to the *entire text line* that the link token sits on.
     Why: In Canva, a hyperlink can be applied to just the bullet (e.g., "2.") or a single
     token in a line. If we only keep words whose centers lie inside the rect, we can end up
     with rows like "2." or "5" instead of the full line. This version:
       1) Collect words whose center lies in the slightly padded rect (R).
-      2) If empty, look in a thin horizontal band that overlaps X with the rect.
-      3) Expand to include *all words on the same (block,line)* as any kept word.
-      4) As a final fallback, use page.get_textbox(rect).
+      2) Expand to include *all words on the same (block,line)* as any kept word.
+      3) As a final fallback, use page.get_textbox(rect).
     
     IMPORTANT: We require at least one word to be found within the link rectangle itself
     (not just nearby) to prevent associating links with unrelated adjacent text.
+    Returns a tuple of (normalized_text, text_line_rect or None).
     """
     import fitz
     if not rect:
@@ -201,9 +201,9 @@ def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 
     # words: [x0,y0,x1,y1,word,block,line,word_no]
     words = page.get_text("words") or []
 
-    # First, find words directly within the link rectangle
-    kept_in_rect = []  # Words actually in the link rect
-    kept = []  # (y0, x0, word, block, line)
+    # First, find words directly within the link rectangle (with padding)
+    kept_in_rect = []  # Words actually in/very near the link rect
+    kept = []  # (y0, x0, word, block, line) captured for line expansion
     for x0, y0, x1, y1, w, b, ln, *_ in words:
         if not w:
             continue
@@ -213,24 +213,10 @@ def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 
             kept_in_rect.append((y0, x0, w, b, ln))
             kept.append((y0, x0, w, b, ln))
 
-    # If no words found directly in the link rectangle, try band fallback
     if not kept_in_rect:
-        # band fallback: same Y ± band, with X overlap (stricter)
-        band = fitz.Rect(r.x0, r.y0 - band_px, r.x1, r.y1 + band_px)
-        for x0, y0, x1, y1, w, b, ln, *_ in words:
-            if not w:
-                continue
-            cy_in = band.y0 <= ((y0 + y1) / 2.0) <= band.y1
-            x_overlaps = not (x1 < r.x0 or x0 > r.x1)
-            if cy_in and x_overlaps:
-                kept.append((y0, x0, w, b, ln))
-                kept_in_rect.append((y0, x0, w, b, ln))  # Count band matches as "in rect" for this check
+        return "", None  # No text associated with this link - return empty to skip it
 
-    # Require that at least one word was found within or very close to the link rectangle
-    # This prevents pulling text from completely unrelated areas
-    if not kept_in_rect:
-        return ""  # No text associated with this link - return empty to skip it
-
+    text_rect = None
     if kept:
         # Expand to the full (block,line) of the kept word(s). Prefer the line with the most words.
         line_keys = [(b, ln) for *_ignore, b, ln in kept]
@@ -250,6 +236,8 @@ def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 
             text_y_min = min(y0 for x0, y0, x1, y1, w in line_word_data)
             text_y_max = max(y1 for x0, y0, x1, y1, w in line_word_data)
             
+            text_rect = fitz.Rect(text_x_min, text_y_min, text_x_max, text_y_max)
+
             # Check if link rectangle overlaps with text bounding box (with some tolerance)
             # If the link is too far from the text, it's probably not associated with it
             tolerance = 50  # pixels
@@ -258,7 +246,7 @@ def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 
             
             if not link_overlaps_text:
                 # Link rectangle doesn't overlap with extracted text - probably wrong association
-                return ""
+                return "", None
             
             # Sort and extract text
             line_words = [(y0, x0, w) for x0, y0, x1, y1, w in line_word_data]
@@ -275,7 +263,7 @@ def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 
         except Exception:
             text = ""
 
-    return _normalize_separators(text)
+    return _normalize_separators(text), text_rect
 
 def split_position_and_title_start(raw: str) -> Tuple[str, str]:
     s = (raw or "").strip()
@@ -493,6 +481,9 @@ def extract_links_by_pages(
 ) -> pd.DataFrame:
     doc = fitz.open("pdf", pdf_bytes)
     rows = []
+    # Track which text-line rectangles have already been consumed by a link so we
+    # do not also add them later as "text block without link".
+    used_text_rects = []
     listed = set(page_to_tag.keys()) if page_to_tag else set()
     
     # Deduplication tracking
@@ -543,7 +534,7 @@ def extract_links_by_pages(
             processed_rects.append(r)
             link_rects.append((r, uri))
             
-            raw = extract_link_title_strict(page, rect, pad_px=pad_px, band_px=band_px)
+            raw, text_rect = extract_link_title_strict(page, rect, pad_px=pad_px, band_px=band_px)
             position, title = split_position_and_title_start(raw)
 
             # Require that at least some text is actually within the link rectangle
@@ -558,7 +549,8 @@ def extract_links_by_pages(
 
             # Deduplication check
             if dedupe_by == "url_and_position":
-                dedupe_key = (pidx, canonical_uri, position)
+                # If we failed to read a position, fall back to URL-only dedupe on this page
+                dedupe_key = (pidx, canonical_uri, position) if position else (pidx, canonical_uri)
             elif dedupe_by == "url_only":
                 dedupe_key = (pidx, canonical_uri)
             else:  # "none"
@@ -570,6 +562,10 @@ def extract_links_by_pages(
             
             if dedupe_key:
                 seen.add(dedupe_key)
+            
+            if text_rect:
+                # Mark this text line as consumed by a link to prevent double-capturing
+                used_text_rects.append(text_rect)
 
             fields = parse_link_title_fields(title)
             type_col = fields.get("Type", "")
@@ -595,12 +591,12 @@ def extract_links_by_pages(
                 "Room": room_col,
                 "Position": position,
                 "Type": type_col,
-                "QTY": fields.get("QTY", ""),
-                "Finish": fields.get("Finish", ""),
-                "Size": fields.get("Size", ""),
-                "link_url": uri,
+                "Quantity": fields.get("Quantity", ""),
+                "Finish/Color": fields.get("Finish/Color", ""),
+                "Dimensions": fields.get("Dimensions", ""),
+                "Product Website": uri,
                 "link_text": title,
-                "Client Name": f"{tag_value.strip()} {fields.get('Type', '').strip()}".strip(),
+                "Client Product Name": f"{tag_value.strip()} {fields.get('Type', '').strip()}".strip(),
                 "Vendor": _vendor_from_url(uri),
             })
         
@@ -630,8 +626,18 @@ def extract_links_by_pages(
                 except Exception:
                     # If intersection check fails, assume no overlap
                     pass
+            overlaps_used_text = False
+            for tr in used_text_rects:
+                try:
+                    # light padding to catch near-identical lines
+                    expanded_tr = fitz.Rect(tr.x0 - 2, tr.y0 - 2, tr.x1 + 2, tr.y1 + 2)
+                    if block_rect.intersects(expanded_tr):
+                        overlaps_used_text = True
+                        break
+                except Exception:
+                    pass
             
-            if overlaps_link or not block_text:
+            if overlaps_link or overlaps_used_text or not block_text:
                 continue
             
             # Skip common headings
@@ -661,12 +667,12 @@ def extract_links_by_pages(
                 "Room": room_col,
                 "Position": position,
                 "Type": type_col,
-                "QTY": fields.get("QTY", ""),
-                "Finish": fields.get("Finish", ""),
-                "Size": fields.get("Size", ""),
-                "link_url": "",  # Blank since no link
+                "Quantity": fields.get("Quantity", ""),
+                "Finish/Color": fields.get("Finish/Color", ""),
+                "Dimensions": fields.get("Dimensions", ""),
+                "Product Website": "",  # Blank since no link
                 "link_text": title,
-                "Client Name": f"{tag_value.strip()} {fields.get('Type', '').strip()}".strip(),
+                "Client Product Name": f"{tag_value.strip()} {fields.get('Type', '').strip()}".strip(),
                 "Vendor": "",
             })
 
@@ -1057,8 +1063,11 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str], *, max_p
             st.error(f"URL column '{url_col}' not found.")
             return out
 
-    # Ensure output columns exist and are string-typed
-    for col in ("scraped_image_url", "price", "scrape_status", "product_title"):
+    # Ensure output columns exist and are string-typed.
+    # Backward compatibility: if older 'product_title' column exists, reuse it as 'Product Name'.
+    if "Product Name" not in out.columns and "product_title" in out.columns:
+        out["Product Name"] = out["product_title"]
+    for col in ("scraped_image_url", "price", "scrape_status", "Product Name"):
         if col not in out.columns:
             out[col] = ""
         out[col] = out[col].astype(str).fillna("")
@@ -1067,7 +1076,7 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str], *, max_p
     imgs   = out["scraped_image_url"].astype(str).fillna("").tolist()
     prices = out["price"].astype(str).fillna("").tolist()
     status = out["scrape_status"].astype(str).fillna("").tolist()
-    titles = out["product_title"].astype(str).fillna("").tolist()
+    titles = out["Product Name"].astype(str).fillna("").tolist()
 
     # Done = has image AND price AND title
     done = [bool(imgs[i]) and bool(prices[i]) and bool(titles[i]) for i in range(len(urls))]
@@ -1097,12 +1106,13 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str], *, max_p
         auto_n = int(st.session_state.get("auto_skip_after_n", 2))
         u = urls[i].strip()
         if not u:
-            imgs[i] = ""; prices[i] = ""; titles[i] = ""; status[i] = (status[i] + "+no_url") if status[i] else "no_url"
+            imgs[i] = ""; prices[i] = ""; titles[i] = titles[i] or "NAME NEEDED"; status[i] = (status[i] + "+no_url+name_needed") if status[i] else "no_url+name_needed"
             prog.progress(k/len(window));
             continue
         # If this URL is manually skipped, mark and move on
         if u in skip_set:
-            status[i] = (status[i] + "+skipped") if status[i] else "skipped"
+            titles[i] = titles[i] or "NAME NEEDED"
+            status[i] = (status[i] + "+skipped+name_needed") if status[i] else "skipped+name_needed"
             prog.progress(k/len(window));
             continue
 
@@ -1130,6 +1140,11 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str], *, max_p
                     st_code = (st_code + "+fetch_failed") if st_code else "fetch_failed"
         except Exception as e:
             st_code = (st_code + "+error") if st_code else "error"
+
+        # If we still don't have a title, mark it explicitly so it's easy to fix later
+        if not title:
+            title = "NAME NEEDED"
+            st_code = (st_code + "+name_needed") if st_code else "name_needed"
 
         # --- Track failures and auto-skip if needed on future passes ---
         if ("fetch_failed" in st_code) or ("error" in st_code):
@@ -1159,7 +1174,7 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str], *, max_p
             tmp["scraped_image_url"] = imgs
             tmp["price"] = prices
             tmp["scrape_status"] = status
-            tmp["product_title"] = titles
+            tmp["Product Name"] = titles
             st.session_state["last_partial_csv"] = tmp.to_csv(index=False).encode("utf-8")
             st.toast("Autosaved partial CSV", icon="💾")
 
@@ -1167,7 +1182,7 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str], *, max_p
         time.sleep(0.05)
 
     # Write back arrays to the DataFrame (strings only)
-    out["scraped_image_url"], out["price"], out["scrape_status"], out["product_title"] = imgs, prices, status, titles
+    out["scraped_image_url"], out["price"], out["scrape_status"], out["Product Name"] = imgs, prices, status, titles
 
     # Persist updated skip/failure state
     st.session_state["skip_urls"] = st.session_state.get("skip_urls", [])
@@ -1316,10 +1331,10 @@ with tab1:
             "Tags": st.column_config.TextColumn("Tags", disabled=True),
             "Position": st.column_config.TextColumn("Position", disabled=True),
             "Type": st.column_config.TextColumn("Type", disabled=True),
-            "QTY": st.column_config.TextColumn("QTY", disabled=True),
-            "Finish": st.column_config.TextColumn("Finish", disabled=True),
-            "Size": st.column_config.TextColumn("Size", disabled=True),
-            "link_url": st.column_config.TextColumn("link_url", disabled=True),
+            "Quantity": st.column_config.TextColumn("Quantity", disabled=True),
+            "Finish/Color": st.column_config.TextColumn("Finish/Color", disabled=True),
+            "Dimensions": st.column_config.TextColumn("Dimensions", disabled=True),
+            "Product Website": st.column_config.TextColumn("Product Website", disabled=True),
             "link_text": st.column_config.TextColumn("link_text", disabled=True),
         }
 
@@ -1426,8 +1441,8 @@ with tab2:
                     mime="text/csv",
                 )
 
-            if st.button("Enrich (Image URL + Price + Title)", key="enrich_btn"):
-                with st.spinner("Scraping image + price + product title..."):
+            if st.button("Enrich (Image URL + Price + Product Name)", key="enrich_btn"):
+                with st.spinner("Scraping image + price + product name..."):
                     df_out = enrich_urls(
                         df_in, url_col, api_key_input,
                         max_per_run=int(max_per_run), start_at=int(start_at), autosave_every=int(autosave_every)
@@ -1476,7 +1491,7 @@ with tab3:
         st.write("**Status:**", status or "unknown")
         st.write("**Image URL:**", img or "—")
         st.write("**Price:**", price or "—")
-        st.write("**Product title:**", title or "—")
+        st.write("**Product Name:**", title or "NAME NEEDED")
         if img:
             st.image(img, caption="Preview", use_container_width=True)
 
