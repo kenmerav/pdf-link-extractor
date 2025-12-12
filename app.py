@@ -820,8 +820,22 @@ def pick_image_and_price_bs4(html: str, base_url: str) -> Tuple[str, str, str]:
 
 # --------- Lumens-specific helpers (targets PDP-large + lazyload) ----------
 LUMENS_PDP_RE = re.compile(
-    r'https://images\.lumens\.com/is/image/Lumens/[A-Za-z0-9_/-]+?\?\$Lumens\.com-PDP-large\$', re.I
+    r'https://images\.lumens\.com/is/image/Lumens/[A-Za-z0-9_/-]+?\?[^\s]*PDP-(?:large|small)[^\s]*',
+    re.I
 )
+
+def _upgrade_lumens_image_url(u: str) -> str:
+    """Convert PDP-small (or sized variants) to PDP-large when possible."""
+    if not isinstance(u, str):
+        return ""
+    u = u.strip()
+    if not u:
+        return ""
+    if "PDP-large" in u:
+        return u
+    if "PDP-small" in u:
+        return u.replace("PDP-small", "PDP-large")
+    return u
 
 def _largest_from_srcset(srcset_value: str) -> str:
     best_url, best_w = "", -1
@@ -890,7 +904,8 @@ def _first_image_from_html(html: str, base_url: str = "") -> str:
 def _first_lumens_pdp_large_from_html(html: str) -> str:
     if not html: return ""
     m = LUMENS_PDP_RE.search(html)
-    if m: return m.group(0)
+    if m:
+        return _upgrade_lumens_image_url(m.group(0))
 
     soup = BeautifulSoup(html, "lxml")
     for im in soup.find_all("img"):
@@ -898,10 +913,15 @@ def _first_lumens_pdp_large_from_html(html: str) -> str:
             v = im.get(attr)
             if isinstance(v, str) and "$Lumens.com-PDP-large$" in v:
                 return v
+            if isinstance(v, str) and "$Lumens.com-PDP-small$" in v:
+                return _upgrade_lumens_image_url(v)
         ss = im.get("srcset") or im.get("data-srcset")
         if isinstance(ss, str) and "$Lumens.com-PDP-large$" in ss:
             cand = _largest_from_srcset(ss)
             if cand: return cand
+        if isinstance(ss, str) and "$Lumens.com-PDP-small$" in ss:
+            cand = _largest_from_srcset(ss)
+            if cand: return _upgrade_lumens_image_url(cand)
 
     for pict in soup.find_all("picture"):
         for src in pict.find_all("source"):
@@ -909,14 +929,19 @@ def _first_lumens_pdp_large_from_html(html: str) -> str:
             if isinstance(ss, str) and "$Lumens.com-PDP-large$" in ss:
                 cand = _largest_from_srcset(ss)
                 if cand: return cand
+            if isinstance(ss, str) and "$Lumens.com-PDP-small$" in ss:
+                cand = _largest_from_srcset(ss)
+                if cand: return _upgrade_lumens_image_url(cand)
 
     preload = soup.find("link", rel=lambda v: v and "preload" in v, attrs={"as": "image"})
     if preload and isinstance(preload.get("href"), str) and "$Lumens.com-PDP-large$" in preload["href"]:
         return preload["href"]
+    if preload and isinstance(preload.get("href"), str) and "$Lumens.com-PDP-small$" in preload["href"]:
+        return _upgrade_lumens_image_url(preload["href"])
 
     return ""
 
-def parse_image_and_price_lumens_from_v2(scrape: dict) -> Tuple[str, str, str]:
+def parse_image_and_price_lumens_from_v2(scrape: dict, base_url: str = "") -> Tuple[str, str, str]:
     """Lumens: prefer PDP-large in markdown/html, then meta/JSON-LD/visible.
     Always return strings for (img, price, title).
     """
@@ -931,9 +956,12 @@ def parse_image_and_price_lumens_from_v2(scrape: dict) -> Tuple[str, str, str]:
     if isinstance(md, str):
         m = LUMENS_PDP_RE.search(md)
         if m:
-            img = m.group(0)
+            img = _upgrade_lumens_image_url(m.group(0))
     if not img:
         img = _first_lumens_pdp_large_from_html(html)
+    if not img:
+        # Fall back to generic HTML image scan (srcset/lazyload)
+        img = _first_image_from_html(html, base_url)
 
     # --- Price ---
     price = ""
@@ -1103,24 +1131,40 @@ def enrich_ferguson_v2(url: str, api_key: str) -> Tuple[str, str, str, str]:
 def enrich_lumens_v2(url: str, api_key: str) -> Tuple[str, str, str, str]:
     u = canonicalize_url(url)
     sc = firecrawl_scrape_v2(u, api_key, mode="simple")
-    img, price, title = parse_image_and_price_lumens_from_v2(sc)
+    img, price, title = parse_image_and_price_lumens_from_v2(sc, u)
     title = normalize_product_title(title, u)
     status = "firecrawl_v2_simple"
     if not img or not price or not title:
         sc2 = firecrawl_scrape_v2(u, api_key, mode="gentle")
-        i2, p2, t2 = parse_image_and_price_lumens_from_v2(sc2)
+        i2, p2, t2 = parse_image_and_price_lumens_from_v2(sc2, u)
         img = img or i2
         price = price or p2
         title = title or normalize_product_title(t2, u)
         status = "firecrawl_v2_gentle" if (i2 or p2 or t2) else status
     if (not img or not price or not title) and api_key:
         sc3 = firecrawl_scrape_v2(u, api_key, mode="full")
-        i3, p3, t3 = parse_image_and_price_lumens_from_v2(sc3)
+        i3, p3, t3 = parse_image_and_price_lumens_from_v2(sc3, u)
         if i3 or p3 or t3:
             img = img or i3
             price = price or p3
             title = title or normalize_product_title(t3, u)
             status = "firecrawl_v2_full"
+    # Ultimate fallback: reuse generic parser if still missing
+    if (not img or not price or not title) and sc:
+        gi, gp, gt = parse_image_and_price_from_v2_generic(sc, u)
+        img = img or gi
+        price = price or gp
+        title = title or normalize_product_title(gt, u)
+        status = status + "+generic_fallback" if status else "generic_fallback"
+    # Final network fallback with bs4 fetch (some Lumens pages hide images in markup that Firecrawl misses)
+    if (not img or not title):
+        r = requests_get(u)
+        if r and r.text:
+            i4, p4, t4 = pick_image_and_price_bs4(r.text, u)
+            img = img or _first_scalar(i4)
+            price = price or _first_scalar(p4)
+            title = title or normalize_product_title(_first_scalar(t4), u)
+            status = (status + "+bs4_ok") if status else "bs4_ok"
     return img, price, title, status
 
 # ----------------- Bulk Enrichment (chunked + resume) -----------------
