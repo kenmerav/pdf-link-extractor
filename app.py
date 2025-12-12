@@ -837,6 +837,13 @@ def _upgrade_lumens_image_url(u: str) -> str:
         return u.replace("PDP-small", "PDP-large")
     return u
 
+def _clean_image_url(u: str) -> str:
+    """Strip common trailing junk like a closing parenthesis or quotes."""
+    if not isinstance(u, str):
+        return ""
+    u = u.strip().strip(')"\'')
+    return u
+
 def _largest_from_srcset(srcset_value: str) -> str:
     best_url, best_w = "", -1
     for part in (srcset_value or "").split(","):
@@ -956,12 +963,12 @@ def parse_image_and_price_lumens_from_v2(scrape: dict, base_url: str = "") -> Tu
     if isinstance(md, str):
         m = LUMENS_PDP_RE.search(md)
         if m:
-            img = _upgrade_lumens_image_url(m.group(0))
+            img = _clean_image_url(_upgrade_lumens_image_url(m.group(0)))
     if not img:
-        img = _first_lumens_pdp_large_from_html(html)
+        img = _clean_image_url(_first_lumens_pdp_large_from_html(html))
     if not img:
         # Fall back to generic HTML image scan (srcset/lazyload)
-        img = _first_image_from_html(html, base_url)
+        img = _clean_image_url(_first_image_from_html(html, base_url))
 
     # --- Price ---
     price = ""
@@ -1132,12 +1139,13 @@ def enrich_lumens_v2(url: str, api_key: str) -> Tuple[str, str, str, str]:
     u = canonicalize_url(url)
     sc = firecrawl_scrape_v2(u, api_key, mode="simple")
     img, price, title = parse_image_and_price_lumens_from_v2(sc, u)
+    img = _clean_image_url(img)
     title = normalize_product_title(title, u)
     status = "firecrawl_v2_simple"
     if not img or not price or not title:
         sc2 = firecrawl_scrape_v2(u, api_key, mode="gentle")
         i2, p2, t2 = parse_image_and_price_lumens_from_v2(sc2, u)
-        img = img or i2
+        img = img or _clean_image_url(i2)
         price = price or p2
         title = title or normalize_product_title(t2, u)
         status = "firecrawl_v2_gentle" if (i2 or p2 or t2) else status
@@ -1145,14 +1153,14 @@ def enrich_lumens_v2(url: str, api_key: str) -> Tuple[str, str, str, str]:
         sc3 = firecrawl_scrape_v2(u, api_key, mode="full")
         i3, p3, t3 = parse_image_and_price_lumens_from_v2(sc3, u)
         if i3 or p3 or t3:
-            img = img or i3
+            img = img or _clean_image_url(i3)
             price = price or p3
             title = title or normalize_product_title(t3, u)
             status = "firecrawl_v2_full"
     # Ultimate fallback: reuse generic parser if still missing
     if (not img or not price or not title) and sc:
         gi, gp, gt = parse_image_and_price_from_v2_generic(sc, u)
-        img = img or gi
+        img = img or _clean_image_url(gi)
         price = price or gp
         title = title or normalize_product_title(gt, u)
         status = status + "+generic_fallback" if status else "generic_fallback"
@@ -1161,7 +1169,7 @@ def enrich_lumens_v2(url: str, api_key: str) -> Tuple[str, str, str, str]:
         r = requests_get(u)
         if r and r.text:
             i4, p4, t4 = pick_image_and_price_bs4(r.text, u)
-            img = img or _first_scalar(i4)
+            img = img or _clean_image_url(_first_scalar(i4))
             price = price or _first_scalar(p4)
             title = title or normalize_product_title(_first_scalar(t4), u)
             status = (status + "+bs4_ok") if status else "bs4_ok"
@@ -1494,7 +1502,11 @@ with tab2:
 
         if df_in is not None:
             st.write("Preview:", df_in.head())
-            url_col_guess = "Product URL" if "Product URL" in df_in.columns else df_in.columns[min(1, len(df_in)-1)]
+            url_col_guess = (
+                "link_url" if "link_url" in df_in.columns
+                else "Product URL" if "Product URL" in df_in.columns
+                else df_in.columns[min(1, len(df_in)-1)]
+            )
             url_col = st.text_input("URL column name", url_col_guess)
 
             # Chunk & resume controls
