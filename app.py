@@ -1657,9 +1657,13 @@ with tab2:
                 st.download_button(
                     "Download latest autosave",
                     data=st.session_state["last_partial_csv"],
-                    file_name="links_enriched_partial.csv",
+                    file_name="links_scraped_partial.csv",
                     mime="text/csv",
                 )
+
+            # Warn if API key is missing
+            if not FIRECRAWL_API_KEY:
+                st.warning("⚠️ FIRECRAWL_API_KEY not found in environment. Scraping will use BeautifulSoup fallback only (less reliable).")
 
             if st.button("Scrape (Image URL + Price + Product Name)", key="enrich_btn"):
                 with st.spinner("Scraping image + price + product name..."):
@@ -1668,25 +1672,48 @@ with tab2:
                         max_per_run=int(max_per_run), start_at=int(start_at), autosave_every=int(autosave_every)
                     )
                 st.session_state["enriched_df"] = df_out
-                st.success("Enriched! ✅")
 
-            # Show enriched results and download section if data exists
+                # Show summary stats
+                total = len(df_out)
+                successful = df_out[
+                    (df_out["scraped_image_url"].astype(str).str.strip() != "") &
+                    (df_out["price"].astype(str).str.strip() != "") &
+                    (df_out["Product Name"].astype(str).str.strip() != "") &
+                    (df_out["Product Name"].astype(str).str.strip() != "NAME NEEDED")
+                ].shape[0]
+                failed = total - successful
+
+                if failed == 0:
+                    st.success(f"✅ Scraped! Successfully scraped all {total} URLs")
+                else:
+                    st.success(f"✅ Scraped! Successfully scraped {successful}/{total} URLs")
+                    st.warning(f"⚠️ {failed} URLs failed or incomplete (see scrape_status column)")
+
+            # Show scraped results and download section if data exists
             if st.session_state.get("enriched_df") is not None:
                 df_out = st.session_state["enriched_df"]
                 st.dataframe(df_out, use_container_width=True)
                 st.caption(df_out["scrape_status"].value_counts(dropna=False).to_frame("count"))
                 out_csv = df_out.to_csv(index=False).encode("utf-8")
 
-                download_filename_tab2 = st.text_input(
-                    "Download filename:",
-                    value="links_enriched.csv",
-                    key="download_filename_tab2",
-                    help="Enter the filename for your CSV download (include .csv extension)"
-                )
+                col_download, col_clear = st.columns([4, 1])
+                with col_download:
+                    download_filename_tab2 = st.text_input(
+                        "Download filename:",
+                        value="links_scraped.csv",
+                        key="download_filename_tab2",
+                        help="Enter the filename for your CSV download (include .csv extension)"
+                    )
+                with col_clear:
+                    st.write("")  # Spacer to align with text input
+                    if st.button("Clear results", key="clear_tab2"):
+                        st.session_state["enriched_df"] = None
+                        st.rerun()
+
                 st.download_button(
-                    "Download enriched CSV",
+                    "Download CSV",
                     data=out_csv,
-                    file_name=download_filename_tab2 if download_filename_tab2 else "links_enriched.csv",
+                    file_name=download_filename_tab2 if download_filename_tab2 else "links_scraped.csv",
                     mime="text/csv",
                 )
 
