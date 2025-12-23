@@ -1564,31 +1564,49 @@ with tab1:
             st.session_state["extracted_df"] = edited_df
             st.success("Room edits saved.")
 
-        download_filename_tab1 = st.text_input(
-            "Download filename:",
-            value="canva_links_with_position.csv",
-            key="download_filename_tab1",
-            help="Enter the filename for your CSV download (include .csv extension)"
-        )
-        st.download_button(
-            "Download CSV",
-            st.session_state["extracted_df"].to_csv(index=False).encode("utf-8"),
-            file_name=download_filename_tab1 if download_filename_tab1 else "canva_links_with_position.csv",
-            mime="text/csv",
-        )
+        st.info("💡 **Next step:** Go to Tab 2 (Scrape Image and Price) to automatically scrape these links, or download the CSV below.")
+
+        with st.expander("Download CSV (optional)"):
+            download_filename_tab1 = st.text_input(
+                "Download filename:",
+                value="canva_links_with_position.csv",
+                key="download_filename_tab1",
+                help="Enter the filename for your CSV download (include .csv extension)"
+            )
+            st.download_button(
+                "Download CSV",
+                st.session_state["extracted_df"].to_csv(index=False).encode("utf-8"),
+                file_name=download_filename_tab1 if download_filename_tab1 else "canva_links_with_position.csv",
+                mime="text/csv",
+            )
 
 # --- Tab 2: Enrich CSV (your version preserved) ---
 with tab2:
-    st.caption("Provide a CSV with a 'Product URL' column (or the 2nd column will be used).")
-    csv_file = st.file_uploader("Upload links CSV", type=["csv"], key="csv_uploader")
-    if csv_file is not None:
-        try:
-            df_in = pd.read_csv(csv_file)
-        except Exception as e:
-            st.error(f"Could not read CSV: {e}")
+    # Check if we have data from Tab 1
+    df_from_tab1 = st.session_state.get("extracted_df")
+
+    if df_from_tab1 is not None:
+        st.success(f"✅ Using {len(df_from_tab1)} links from Tab 1 (Extract Links from Canva)")
+        col1, col2 = st.columns([4, 1])
+        with col2:
+            if st.button("Clear and upload new CSV", key="clear_tab1_data"):
+                st.session_state["extracted_df"] = None
+                st.session_state["enriched_df"] = None
+                st.rerun()
+        df_in = df_from_tab1
+    else:
+        st.caption("Upload a CSV with a 'Product Website' column, or extract links from Tab 1.")
+        csv_file = st.file_uploader("Upload links CSV", type=["csv"], key="csv_uploader")
+        if csv_file is not None:
+            try:
+                df_in = pd.read_csv(csv_file)
+            except Exception as e:
+                st.error(f"Could not read CSV: {e}")
+                df_in = None
+        else:
             df_in = None
 
-        if df_in is not None:
+    if df_in is not None:
             st.write("Preview:", df_in.head())
             url_col_guess = (
                 "Product Website" if "Product Website" in df_in.columns
