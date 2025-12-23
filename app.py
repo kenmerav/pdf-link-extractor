@@ -1591,8 +1591,9 @@ with tab2:
         if df_in is not None:
             st.write("Preview:", df_in.head())
             url_col_guess = (
-                "link_url" if "link_url" in df_in.columns
+                "Product Website" if "Product Website" in df_in.columns
                 else "Product URL" if "Product URL" in df_in.columns
+                else "link_url" if "link_url" in df_in.columns
                 else df_in.columns[min(1, len(df_in)-1)]
             )
             url_col = st.text_input("URL column name", url_col_guess)
