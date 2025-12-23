@@ -1448,9 +1448,7 @@ with tab1:
         }
     )
     only_listed = st.checkbox("Only extract pages listed above", value=True)
-    pad_px = st.slider("Link capture pad (pixels)", 0, 16, 4, 1)
-    band_px = st.slider("Nearby text band (pixels)", 0, 60, 28, 2)
-    
+
     dedupe_mode = st.selectbox(
         "Deduplication mode",
         options=["url_and_position", "url_only", "none"],
@@ -1509,8 +1507,8 @@ with tab1:
             df, duplicates_skipped = extract_links_by_pages(
                 st.session_state["pdf_bytes"], page_to_tag, None,
                 only_listed_pages=only_listed,
-                pad_px=pad_px,
-                band_px=band_px,
+                pad_px=4.0,
+                band_px=28.0,
                 dedupe_by=dedupe_mode_value,
                 type_to_room_map=type_to_room_map_value
             )
