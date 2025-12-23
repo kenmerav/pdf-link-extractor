@@ -1,5 +1,5 @@
 import os, io, re, json, time, requests
-from typing import Optional, Tuple, Dict, Iterable
+from typing import Optional, Tuple, Dict, Iterable, List, Any, Union, Set
 import streamlit as st
 import fitz  # PyMuPDF
 import pandas as pd
@@ -26,18 +26,18 @@ for k, v in {
 
 # --- Progress timer helper ---
 class Timer:
-    def __enter__(self):
-        self.t0 = time.perf_counter()
+    def __enter__(self) -> 'Timer':
+        self.t0: float = time.perf_counter()
         return self
-    def __exit__(self, *exc):
-        self.dt = time.perf_counter() - self.t0
+    def __exit__(self, *exc: Any) -> None:
+        self.dt: float = time.perf_counter() - self.t0
 
 # ========================= Shared HTTP/parsing helpers =========================
 PRICE_RE = re.compile(r"\$\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?")
 UA = {"User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
 
 # --- Safe scalar helper to avoid list/dict values leaking into DataFrame columns ---
-def _first_scalar(v):
+def _first_scalar(v: Any) -> str:
     """Return a single string from possibly-list/dict values (e.g., meta['image'])."""
     if v is None:
         return ""
@@ -178,7 +178,7 @@ def parse_link_title_fields(link_text: str) -> Dict[str, str]:
 
     return fields
 
-def extract_link_title_strict(page, rect, pad_px: float = 4.0, band_px: float = 28.0):
+def extract_link_title_strict(page: fitz.Page, rect: fitz.Rect, pad_px: float = 4.0, band_px: float = 28.0) -> Tuple[str, Optional[fitz.Rect]]:
     """
     STRICT per-link capture but expanded to the *entire text line* that the link token sits on.
     Why: In Canva, a hyperlink can be applied to just the bullet (e.g., "2.") or a single
@@ -478,7 +478,7 @@ def extract_links_by_pages(
     view_mode: str = "trade",  # "trade" (old behavior) or "room"
     dedupe_by: str = "url_and_position",  # "url_and_position", "url_only", or "none"
     type_to_room_map: Optional[Dict[str, str]] = None,  # Map of type -> room for auto-filling
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, int]:
     doc = fitz.open("pdf", pdf_bytes)
     rows = []
     # Track which text-line rectangles have already been consumed by a link so we
@@ -719,7 +719,7 @@ def normalize_product_title(raw: str, url: Optional[str] = None) -> str:
     t = " ".join(t.split()).strip('\"\'')
     return t
 
-def extract_title_from_html(meta: dict, html: str) -> str:
+def extract_title_from_html(meta: Dict[str, Any], html: str) -> str:
     """Best-effort product/page title from meta + JSON-LD + visible H1/Title."""
     title = ""
     for k in ("og:title", "twitter:title", "title"):
@@ -948,109 +948,164 @@ def _first_lumens_pdp_large_from_html(html: str) -> str:
 
     return ""
 
-def parse_image_and_price_lumens_from_v2(scrape: dict, base_url: str = "") -> Tuple[str, str, str]:
-    """Lumens: prefer PDP-large in markdown/html, then meta/JSON-LD/visible.
-    Always return strings for (img, price, title).
+def parse_image_and_price_lumens_from_v2(scrape: Dict[str, Any], base_url: str = "") -> Tuple[str, str, str]:
+    """
+    Lumens-specific parser: prioritizes structured JSON, then Lumens PDP-large images.
+    Returns (img, price, title).
     """
     if not scrape:
         return "", "", ""
+
     data = scrape.get("data") or {}
     html = data.get("html") or ""
-    md   = data.get("markdown") or ""
+    md = data.get("markdown") or ""
 
-    # --- Image ---
-    img = ""
-    if isinstance(md, str):
-        m = LUMENS_PDP_RE.search(md)
-        if m:
-            img = _clean_image_url(_upgrade_lumens_image_url(m.group(0)))
+    # Priority 1: Use structured JSON extraction from Firecrawl
+    json_data = data.get("json") or {}
+    if isinstance(json_data, dict):
+        content = json_data.get("content") if isinstance(json_data.get("content"), dict) else json_data
+
+        img = _first_scalar(content.get("imageUrl", ""))
+        price = _first_scalar(content.get("price", ""))
+        title = _first_scalar(content.get("productName", ""))
+
+        # For Lumens, upgrade image to PDP-large if we got a smaller version
+        if img and "lumens.com" in img.lower():
+            img = _upgrade_lumens_image_url(img)
+
+        # Ensure price has currency symbol
+        if price and not price.startswith("$"):
+            price = f"${price}"
+
+        # If we got all data from JSON, return it
+        if img and price and title:
+            return _clean_image_url(img), price, normalize_product_title(title, base_url)
+    else:
+        img = price = title = ""
+
+    # Priority 2: Lumens-specific PDP-large image search in markdown/HTML
     if not img:
-        img = _clean_image_url(_first_lumens_pdp_large_from_html(html))
-    if not img:
-        # Fall back to generic HTML image scan (srcset/lazyload)
-        img = _clean_image_url(_first_image_from_html(html, base_url))
+        if isinstance(md, str):
+            m = LUMENS_PDP_RE.search(md)
+            if m:
+                img = _clean_image_url(_upgrade_lumens_image_url(m.group(0)))
 
-    # --- Price ---
-    price = ""
-    j = data.get("json")
-    if isinstance(j, dict):
-        content = j.get("content") if isinstance(j.get("content"), dict) else j
-        if isinstance(content, dict):
-            price = (content.get("price") or "").strip()
+        if not img:
+            img = _clean_image_url(_first_lumens_pdp_large_from_html(html))
 
+        # Fallback to generic HTML image scan
+        if not img:
+            img = _clean_image_url(_first_image_from_html(html, base_url))
+
+    # Priority 3: Price from HTML parsing (only if not in JSON)
     if not price and html:
-        soup = BeautifulSoup(html or "", "lxml")
+        soup = BeautifulSoup(html, "lxml")
+
+        # JSON-LD structured data
         for tag in soup.find_all("script", type="application/ld+json"):
             try:
                 obj = json.loads(tag.string or "")
+                objs = obj if isinstance(obj, list) else [obj]
+                for o in objs:
+                    t = o.get("@type")
+                    if t == "Product" or (isinstance(t, list) and "Product" in t):
+                        offers = o.get("offers") or {}
+                        if isinstance(offers, list):
+                            offers = offers[0] if offers else {}
+                        p = offers.get("price") or (offers.get("priceSpecification") or {}).get("price")
+                        if p:
+                            price = p if str(p).startswith("$") else f"${p}"
+                            break
+                if price:
+                    break
             except Exception:
                 continue
-            objs = obj if isinstance(obj, list) else [obj]
-            for o in objs:
-                t = o.get("@type")
-                if t == "Product" or (isinstance(t, list) and "Product" in t):
-                    offers = o.get("offers") or {}
-                    if isinstance(offers, list):
-                        offers = offers[0] if offers else {}
-                    p = offers.get("price") or (offers.get("priceSpecification") or {}).get("price")
-                    if p:
-                        price = p if str(p).startswith("$") else f"${p}"
-                        break
-            if price:
-                break
+
+        # Meta tag price
         if not price:
             m = soup.find("meta", attrs={"itemprop": "price"}) or \
                 soup.find("meta", attrs={"property": "product:price:amount"})
             if m and m.get("content"):
                 val = m["content"]
                 price = val if str(val).startswith("$") else f"${val}"
+
+        # Regex price search
         if not price:
-            t = soup.get_text(" ", strip=True)
-            m = PRICE_RE.search(t)
+            m = PRICE_RE.search(soup.get_text(" ", strip=True))
             if m:
                 price = m.group(0)
 
-    # --- Title (compute independently so it's always defined) ---
-    title = extract_title_from_html(data.get("metadata") or {}, html)
+    # Title extraction
+    if not title:
+        title = extract_title_from_html(data.get("metadata") or {}, html)
 
     return img or "", price or "", title or ""
 
 # ----------------- Firecrawl v2 (REST) helpers -----------------
-def firecrawl_scrape_v2(url: str, api_key: str, mode: str = "simple") -> dict:
+def firecrawl_scrape_v2(url: str, api_key: str, mode: str = "simple") -> Dict[str, Any]:
     """
-    Call Firecrawl /v2/scrape via REST.
-    We ask for HTML + MARKDOWN so we can regex the PDP-large image.
+    Call Firecrawl /v2/scrape via REST with comprehensive product data extraction.
+    Uses a structured schema to extract all product details in one call.
     """
     if not api_key:
         return {}
+
+    # Comprehensive schema for product data extraction
+    product_schema = {
+        "type": "object",
+        "properties": {
+            "productName": {
+                "type": "string",
+                "description": "Full product name or title, without site name or extra text"
+            },
+            "price": {
+                "type": "string",
+                "description": "Product price with currency symbol (e.g., $299.00)"
+            },
+            "brand": {
+                "type": "string",
+                "description": "Brand or manufacturer name"
+            },
+            "imageUrl": {
+                "type": "string",
+                "description": "Main product image URL - prefer largest/highest quality version"
+            },
+            "description": {
+                "type": "string",
+                "description": "Product description or summary"
+            },
+            "dimensions": {
+                "type": "string",
+                "description": "Product dimensions or size (e.g., 24 x 12 x 8 inches)"
+            },
+            "finish": {
+                "type": "string",
+                "description": "Product finish, color, or material"
+            },
+            "availability": {
+                "type": "string",
+                "description": "Stock status (in stock, out of stock, etc.)"
+            }
+        },
+        "required": []
+    }
+
     payload = {
         "url": url,
         "formats": [
             "html",
             "markdown",
-            { "type": "json", "schema": {
-                "type": "object",
-                "properties": { "price": { "type": "string" } },
-                "required": []
-            }}
+            {"type": "json", "schema": product_schema}
         ],
         "proxy": "auto",
         "timeout": 45000,
     }
-    if mode == "gentle":
+
+    # Simplified mode system - just standard and deep
+    if mode == "deep":
         payload["actions"] = [
-            {"type": "wait", "milliseconds": 800},
-            {"type": "scroll", "y": 1200},
-            {"type": "wait", "milliseconds": 1200},
-        ]
-    elif mode == "full":
-        payload["actions"] = [
-            {"type": "wait", "milliseconds": 1200},
+            {"type": "wait", "milliseconds": 1500},
             {"type": "scroll", "y": 2000},
-            {"type": "wait", "milliseconds": 1800},
-            {"type": "scroll", "y": 4000},
-            {"type": "wait", "milliseconds": 1800},
-            {"type": "scroll", "y": 6000},
             {"type": "wait", "milliseconds": 2000},
         ]
 
@@ -1066,67 +1121,105 @@ def firecrawl_scrape_v2(url: str, api_key: str, mode: str = "simple") -> dict:
     except Exception:
         return {}
 
-def parse_image_and_price_from_v2_generic(scrape: dict, base_url: str = "") -> Tuple[str, str, str]:
-    """Generic Firecrawl parse: OG/Twitter/meta + JSON-LD + visible + title.
-    Ensures scalar strings are returned (not lists/dicts) to keep DataFrame columns homogenous.
+def parse_image_and_price_from_v2_generic(scrape: Dict[str, Any], base_url: str = "") -> Tuple[str, str, str]:
     """
-    if not scrape: return "", "", ""
+    Parse product data from Firecrawl v2 response.
+    Prioritizes structured JSON extraction, falls back to metadata and HTML parsing.
+    Returns (image_url, price, title).
+    """
+    if not scrape:
+        return "", "", ""
+
     data = scrape.get("data") or {}
+
+    # Priority 1: Use structured JSON extraction from Firecrawl
+    json_data = data.get("json") or {}
+    if isinstance(json_data, dict):
+        # Handle nested content structure that some Firecrawl responses have
+        content = json_data.get("content") if isinstance(json_data.get("content"), dict) else json_data
+
+        img = _first_scalar(content.get("imageUrl", ""))
+        price = _first_scalar(content.get("price", ""))
+        title = _first_scalar(content.get("productName", ""))
+
+        # Ensure price has currency symbol
+        if price and not price.startswith("$"):
+            price = f"${price}"
+
+        # If we got all data from JSON, return it
+        if img and price and title:
+            return img, price, normalize_product_title(title, base_url)
+    else:
+        img = price = title = ""
+
+    # Priority 2: Metadata (og:image, twitter, etc.)
     meta = data.get("metadata") or {}
     html = data.get("html") or ""
 
-    img = meta.get("og:image") or meta.get("twitter:image") or meta.get("image") or ""
-    img = _first_scalar(img)
-    # If no image from meta, try to parse HTML for lazy-loaded/srcset images
-    if (not img) and html:
-        img = _first_image_from_html(html, base_url)
-    price = ""
-    if html:
-        soup = BeautifulSoup(html or "", "lxml")
+    if not img:
+        img = _first_scalar(meta.get("og:image") or meta.get("twitter:image") or meta.get("image") or "")
+
+    if not title:
+        title = extract_title_from_html(meta, html)
+
+    # Priority 3: HTML parsing fallback (only if still missing data)
+    if (not img or not price) and html:
+        soup = BeautifulSoup(html, "lxml")
+
+        # Image from HTML
+        if not img:
+            img = _first_image_from_html(html, base_url)
+
+        # Price from JSON-LD or visible text
         if not price:
             for tag in soup.find_all("script", type="application/ld+json"):
                 try:
                     obj = json.loads(tag.string or "")
+                    objs = obj if isinstance(obj, list) else [obj]
+                    for o in objs:
+                        t = o.get("@type")
+                        if t == "Product" or (isinstance(t, list) and "Product" in t):
+                            offers = o.get("offers") or {}
+                            if isinstance(offers, list):
+                                offers = offers[0] if offers else {}
+                            p = offers.get("price") or (offers.get("priceSpecification") or {}).get("price")
+                            if p:
+                                price = p if str(p).startswith("$") else f"${p}"
+                                break
+                    if price:
+                        break
                 except Exception:
                     continue
-                objs = obj if isinstance(obj, list) else [obj]
-                for o in objs:
-                    t = o.get("@type")
-                    if t == "Product" or (isinstance(t, list) and "Product" in t):
-                        offers = o.get("offers") or {}
-                        if isinstance(offers, list): offers = offers[0] if offers else {}
-                        p = offers.get("price") or (offers.get("priceSpecification") or {}).get("price")
-                        if p:
-                            price = p if str(p).startswith("$") else f"${p}"
-                            break
-                if price: break
-        if not price:
-            m = PRICE_RE.search(soup.get_text(" ", strip=True))
-            if m: price = m.group(0)
-    title = extract_title_from_html(meta, html)
+
+            # Last resort: regex price search
+            if not price:
+                m = PRICE_RE.search(soup.get_text(" ", strip=True))
+                if m:
+                    price = m.group(0)
+
     return _first_scalar(img) or "", _first_scalar(price) or "", _first_scalar(title) or ""
 
 def enrich_domain_firecrawl_v2(url: str, api_key: str) -> Tuple[str, str, str, str]:
+    """
+    Generic domain enrichment using Firecrawl v2.
+    Tries standard scrape first, then deep scrape if needed.
+    """
+    # Try standard scrape first
     sc = firecrawl_scrape_v2(url, api_key, mode="simple")
     img, price, title = parse_image_and_price_from_v2_generic(sc, url)
     title = normalize_product_title(title, url)
-    status = "firecrawl_v2_simple"
-    if not img or not price or not title:
-        sc2 = firecrawl_scrape_v2(url, api_key, mode="gentle")
+    status = "firecrawl_v2"
+
+    # If missing any data, try deep scrape with scrolling
+    if (not img or not price or not title) and api_key:
+        sc2 = firecrawl_scrape_v2(url, api_key, mode="deep")
         i2, p2, t2 = parse_image_and_price_from_v2_generic(sc2, url)
         img = img or i2
         price = price or p2
         title = title or normalize_product_title(t2, url)
-        status = "firecrawl_v2_gentle" if (i2 or p2 or t2) else status
-    # Final deep scrape with more scrolling/waiting if still missing pieces
-    if (not img or not price or not title) and api_key:
-        sc3 = firecrawl_scrape_v2(url, api_key, mode="full")
-        i3, p3, t3 = parse_image_and_price_from_v2_generic(sc3, url)
-        if i3 or p3 or t3:
-            img = img or i3
-            price = price or p3
-            title = title or normalize_product_title(t3, url)
-            status = "firecrawl_v2_full"
+        if i2 or p2 or t2:
+            status = "firecrawl_v2_deep"
+
     return img, price, title, status
 
 def enrich_wayfair_v2(url: str, api_key: str) -> Tuple[str, str, str, str]:
@@ -1136,43 +1229,40 @@ def enrich_ferguson_v2(url: str, api_key: str) -> Tuple[str, str, str, str]:
     return enrich_domain_firecrawl_v2(url, api_key)
 
 def enrich_lumens_v2(url: str, api_key: str) -> Tuple[str, str, str, str]:
+    """
+    Lumens-specific enrichment with PDP-large image optimization.
+    Uses structured JSON extraction first, then Lumens-specific fallbacks.
+    """
     u = canonicalize_url(url)
+
+    # Try standard scrape first
     sc = firecrawl_scrape_v2(u, api_key, mode="simple")
     img, price, title = parse_image_and_price_lumens_from_v2(sc, u)
     img = _clean_image_url(img)
     title = normalize_product_title(title, u)
-    status = "firecrawl_v2_simple"
-    if not img or not price or not title:
-        sc2 = firecrawl_scrape_v2(u, api_key, mode="gentle")
+    status = "firecrawl_v2"
+
+    # If missing any data, try deep scrape
+    if (not img or not price or not title) and api_key:
+        sc2 = firecrawl_scrape_v2(u, api_key, mode="deep")
         i2, p2, t2 = parse_image_and_price_lumens_from_v2(sc2, u)
         img = img or _clean_image_url(i2)
         price = price or p2
         title = title or normalize_product_title(t2, u)
-        status = "firecrawl_v2_gentle" if (i2 or p2 or t2) else status
-    if (not img or not price or not title) and api_key:
-        sc3 = firecrawl_scrape_v2(u, api_key, mode="full")
-        i3, p3, t3 = parse_image_and_price_lumens_from_v2(sc3, u)
-        if i3 or p3 or t3:
-            img = img or _clean_image_url(i3)
-            price = price or p3
-            title = title or normalize_product_title(t3, u)
-            status = "firecrawl_v2_full"
-    # Ultimate fallback: reuse generic parser if still missing
-    if (not img or not price or not title) and sc:
-        gi, gp, gt = parse_image_and_price_from_v2_generic(sc, u)
-        img = img or _clean_image_url(gi)
-        price = price or gp
-        title = title or normalize_product_title(gt, u)
-        status = status + "+generic_fallback" if status else "generic_fallback"
-    # Final network fallback with bs4 fetch (some Lumens pages hide images in markup that Firecrawl misses)
-    if (not img or not title):
+        if i2 or p2 or t2:
+            status = "firecrawl_v2_deep"
+
+    # Final fallback: direct HTTP request with BeautifulSoup (rare edge cases)
+    if not img or not title:
         r = requests_get(u)
         if r and r.text:
-            i4, p4, t4 = pick_image_and_price_bs4(r.text, u)
-            img = img or _clean_image_url(_first_scalar(i4))
-            price = price or _first_scalar(p4)
-            title = title or normalize_product_title(_first_scalar(t4), u)
-            status = (status + "+bs4_ok") if status else "bs4_ok"
+            i3, p3, t3 = pick_image_and_price_bs4(r.text, u)
+            img = img or _clean_image_url(_first_scalar(i3))
+            price = price or _first_scalar(p3)
+            title = title or normalize_product_title(_first_scalar(t3), u)
+            if i3 or p3 or t3:
+                status = status + "+bs4" if status else "bs4"
+
     return img, price, title, status
 
 # ----------------- Bulk Enrichment (chunked + resume) -----------------
@@ -1337,7 +1427,7 @@ tab1, tab2, tab3 = st.tabs([
 ])
 
 # Helper for the Extract button
-def _start_extract():
+def _start_extract() -> None:
     st.session_state["pending_extract"] = True
 
 # --- Tab 1: Canva PDF → rows ---
