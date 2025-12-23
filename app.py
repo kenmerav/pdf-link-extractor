@@ -1661,7 +1661,7 @@ with tab2:
                     mime="text/csv",
                 )
 
-            if st.button("Enrich (Image URL + Price + Product Name)", key="enrich_btn"):
+            if st.button("Scrape (Image URL + Price + Product Name)", key="enrich_btn"):
                 with st.spinner("Scraping image + price + product name..."):
                     df_out = enrich_urls(
                         df_in, url_col, FIRECRAWL_API_KEY,
