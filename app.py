@@ -15,6 +15,7 @@ for k, v in {
     "pdf_bytes": None,
     "num_pages": None,
     "extracted_df": None,
+    "enriched_df": None,
     "pending_extract": False,  # gate extraction so Save doesn't re-extract
     # --- Skip/auto-skip controls for enrichment ---
     "skip_urls": [],                 # list[str] of URLs to skip
@@ -1666,7 +1667,12 @@ with tab2:
                         df_in, url_col, FIRECRAWL_API_KEY,
                         max_per_run=int(max_per_run), start_at=int(start_at), autosave_every=int(autosave_every)
                     )
+                st.session_state["enriched_df"] = df_out
                 st.success("Enriched! ✅")
+
+            # Show enriched results and download section if data exists
+            if st.session_state.get("enriched_df") is not None:
+                df_out = st.session_state["enriched_df"]
                 st.dataframe(df_out, use_container_width=True)
                 st.caption(df_out["scrape_status"].value_counts(dropna=False).to_frame("count"))
                 out_csv = df_out.to_csv(index=False).encode("utf-8")
