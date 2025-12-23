@@ -1407,17 +1407,10 @@ def enrich_urls(df: pd.DataFrame, url_col: str, api_key: Optional[str], *, max_p
     st.session_state["fail_counts"] = st.session_state.get("fail_counts", {})
     return out
 
-# ----------------- Sidebar (API key) -----------------
-
-with st.sidebar:
-    st.subheader("Firecrawl (optional)")
-    api_key_input = st.text_input(
-        "FIRECRAWL_API_KEY",
-        value=os.getenv("FIRECRAWL_API_KEY", ""),
-        type="password",
-        help="Put this in Streamlit Cloud → Settings → Secrets, or paste it here."
-    )
-    st.caption("Leave blank to use the built-in parser only (no credits used).")
+# ----------------- Get API key from environment only -----------------
+# API key is read from Streamlit secrets (set in Cloud → Settings → Secrets)
+# Add this line to your secrets.toml: FIRECRAWL_API_KEY = "your-key-here"
+FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "")
 
 # ----------------- Tabs -----------------
 tab1, tab2, tab3 = st.tabs([
@@ -1666,7 +1659,7 @@ with tab2:
             if st.button("Enrich (Image URL + Price + Product Name)", key="enrich_btn"):
                 with st.spinner("Scraping image + price + product name..."):
                     df_out = enrich_urls(
-                        df_in, url_col, api_key_input,
+                        df_in, url_col, FIRECRAWL_API_KEY,
                         max_per_run=int(max_per_run), start_at=int(start_at), autosave_every=int(autosave_every)
                     )
                 st.success("Enriched! ✅")
@@ -1689,15 +1682,15 @@ with tab3:
     )
     if st.button("Run test", key="single_test_btn"):
         img = price = title = ""; status = ""
-        if api_key_input:
+        if FIRECRAWL_API_KEY:
             if "lumens.com" in test_url:
-                img, price, title, status = enrich_lumens_v2(test_url, api_key_input)
+                img, price, title, status = enrich_lumens_v2(test_url, FIRECRAWL_API_KEY)
             elif "fergusonhome.com" in test_url:
-                img, price, title, status = enrich_ferguson_v2(test_url, api_key_input)
+                img, price, title, status = enrich_ferguson_v2(test_url, FIRECRAWL_API_KEY)
             elif "wayfair.com" in test_url:
-                img, price, title, status = enrich_wayfair_v2(test_url, api_key_input)
+                img, price, title, status = enrich_wayfair_v2(test_url, FIRECRAWL_API_KEY)
             else:
-                img, price, title, status = enrich_domain_firecrawl_v2(test_url, api_key_input)
+                img, price, title, status = enrich_domain_firecrawl_v2(test_url, FIRECRAWL_API_KEY)
 
         if not img or not price or not title:
             r = requests_get(test_url)
