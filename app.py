@@ -1414,8 +1414,8 @@ FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "")
 
 # ----------------- Tabs -----------------
 tab1, tab2, tab3 = st.tabs([
-    "1) Extract from PDF (pages + Tags + Position + full titles)",
-    "2) Enrich CSV (Image URL + Price)",
+    "1) Extract Links from Canva",
+    "2) Scrape Image and Price",
     "3) Test single URL"
 ])
 
@@ -1563,10 +1563,16 @@ with tab1:
             st.session_state["extracted_df"] = edited_df
             st.success("Room edits saved.")
 
+        download_filename_tab1 = st.text_input(
+            "Download filename:",
+            value="canva_links_with_position.csv",
+            key="download_filename_tab1",
+            help="Enter the filename for your CSV download (include .csv extension)"
+        )
         st.download_button(
             "Download CSV",
             st.session_state["extracted_df"].to_csv(index=False).encode("utf-8"),
-            file_name="canva_links_with_position.csv",
+            file_name=download_filename_tab1 if download_filename_tab1 else "canva_links_with_position.csv",
             mime="text/csv",
         )
 
@@ -1664,10 +1670,17 @@ with tab2:
                 st.dataframe(df_out, use_container_width=True)
                 st.caption(df_out["scrape_status"].value_counts(dropna=False).to_frame("count"))
                 out_csv = df_out.to_csv(index=False).encode("utf-8")
+
+                download_filename_tab2 = st.text_input(
+                    "Download filename:",
+                    value="links_enriched.csv",
+                    key="download_filename_tab2",
+                    help="Enter the filename for your CSV download (include .csv extension)"
+                )
                 st.download_button(
                     "Download enriched CSV",
                     data=out_csv,
-                    file_name="links_enriched.csv",
+                    file_name=download_filename_tab2 if download_filename_tab2 else "links_enriched.csv",
                     mime="text/csv",
                 )
 
