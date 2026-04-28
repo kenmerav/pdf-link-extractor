@@ -17,6 +17,7 @@ for k, v in {
     "extracted_df": None,
     "enriched_df": None,
     "pending_extract": False,  # gate extraction so Save doesn't re-extract
+    "template_mode": "old",
     # --- Skip/auto-skip controls for enrichment ---
     "skip_urls": [],                 # list[str] of URLs to skip
     "fail_counts": {},              # dict[url->int] failure counts
@@ -84,10 +85,12 @@ def canonicalize_url(u: str) -> str:
 
 # ========================= TAB 1: Canva PDF extractor =========================
 # Robust parsers (case-insensitive, tolerate ":" or "-", smart quotes, etc.)
-QTY_RE     = re.compile(r"(?i)\b(?:QTY|Quantity)\b\s*[:\-]?\s*([0-9X]+)\b")
+QTY_RE     = re.compile(r"(?i)\b(?:QTY|Quantity)\b\s*[:\-]?\s*([0-9X]+|TBD)\b")
 FINISH_RE  = re.compile(r"(?i)\bFinish\b\s*[:\-]?\s*(.+)")
 SIZE_RE    = re.compile(r"(?i)\b(?:Size|Dimensions?)\b\s*[:\-]?\s*(.+)")
 TYPE_RE    = re.compile(r"(?i)\bType\b\s*[:\-]?\s*(.+)")
+CURATED_SELECTIONS_RE = re.compile(r"(?i)\b(.+?)\s+CURATED\s+SELECTIONS\b")
+PAGE_NUMBER_RE = re.compile(r"^\s*(\d+)(?:\.0+)?\s*$")
 
 # --- Support spelled-out QTY values (e.g., QTY: TWO) ---
 NUMBER_WORDS = {
@@ -104,6 +107,8 @@ def _normalize_qty_token(token: str) -> str:
     t = token.strip().lower().replace("-", " ")
     if t.isdigit():
         return t
+    if t == "tbd":
+        return "TBD"
     return NUMBER_WORDS.get(t, "")
 
 # bullets/positions: “1.”, “1 ”, middle dot, small dot
@@ -144,6 +149,10 @@ def parse_link_title_fields(link_text: str) -> Dict[str, str]:
             else:
                 q_up = q_raw.upper()
                 fields["Quantity"] = "" if q_up == "XX" else q_up
+            if not fields["Type"]:
+                type_prefix = tok[:m.start()].strip(" |-")
+                if type_prefix:
+                    fields["Type"] = type_prefix
             continue
 
         # Fallback: handle cases like "QTY: TWO" or "Quantity - THREE" when regex didn't catch digits
@@ -157,6 +166,12 @@ def parse_link_title_fields(link_text: str) -> Dict[str, str]:
             q_norm = _normalize_qty_token(word)
             if q_norm:
                 fields["Quantity"] = q_norm
+                if not fields["Type"]:
+                    qty_start = re.search(r"(?i)\b(?:QTY|Quantity)\b", tok)
+                    if qty_start:
+                        type_prefix = tok[:qty_start.start()].strip(" |-")
+                        if type_prefix:
+                            fields["Type"] = type_prefix
                 continue
         m = FINISH_RE.search(tok)
         if m and not fields["Finish/Color"]:
@@ -179,7 +194,7 @@ def parse_link_title_fields(link_text: str) -> Dict[str, str]:
 
     return fields
 
-def extract_link_title_strict(page: fitz.Page, rect: fitz.Rect, pad_px: float = 4.0, band_px: float = 28.0) -> Tuple[str, Optional[fitz.Rect]]:
+def extract_link_title_old(page: fitz.Page, rect: fitz.Rect, pad_px: float = 4.0, band_px: float = 28.0) -> Tuple[str, Optional[fitz.Rect]]:
     """
     STRICT per-link capture but expanded to the *entire text line* that the link token sits on.
     Why: In Canva, a hyperlink can be applied to just the bullet (e.g., "2.") or a single
@@ -266,6 +281,208 @@ def extract_link_title_strict(page: fitz.Page, rect: fitz.Rect, pad_px: float = 
 
     return _normalize_separators(text), text_rect
 
+def normalize_new_template_title_text(text: str) -> str:
+    text = re.sub(r"(?i)\s*\|\s*(?=(?:QTY|Quantity)\b)", " | ", text)
+    text = re.sub(r"(?i)(?<![|;])\s+(?=(?:QTY|Quantity)\b)", " | ", text, count=1)
+    text = re.sub(r"(?i)\b(QTY|Quantity)\b\s*[:\-]?\s*(TBD|[0-9X]+)\b", lambda m: f"QTY: {m.group(2).upper()}", text)
+    return _normalize_separators(text)
+
+def looks_like_new_template_title_line(text: str) -> bool:
+    cleaned = " ".join((text or "").split()).strip()
+    if not cleaned:
+        return False
+
+    if re.search(r"(?i)\b(?:QTY|Quantity)\b", cleaned):
+        return True
+
+    word_count = len(cleaned.split())
+    if word_count == 0 or word_count > 8:
+        return False
+
+    letters_only = re.sub(r"[^A-Za-z ]+", "", cleaned).strip()
+    if not letters_only:
+        return False
+
+    # New template titles are usually short labels like "Shower System" or
+    # "Cabinetry Finish", even when they do not include a QTY token.
+    return True
+
+def extract_link_title_new_nearest_line(page: fitz.Page, rect: fitz.Rect) -> Tuple[str, Optional[fitz.Rect]]:
+    if not rect:
+        return "", None
+
+    r = fitz.Rect(rect).normalize()
+    words = page.get_text("words") or []
+    lines: Dict[Tuple[int, int], List[Tuple[float, float, float, float, str]]] = {}
+
+    for x0, y0, x1, y1, w, b, ln, *_ in words:
+        if not w:
+            continue
+        key = (int(b), int(ln))
+        lines.setdefault(key, []).append((float(x0), float(y0), float(x1), float(y1), str(w)))
+
+    candidates: List[Tuple[float, str, fitz.Rect]] = []
+
+    for line_words in lines.values():
+        line_words.sort(key=lambda item: (round(item[1], 3), item[0]))
+        line_rect = fitz.Rect(
+            min(item[0] for item in line_words),
+            min(item[1] for item in line_words),
+            max(item[2] for item in line_words),
+            max(item[3] for item in line_words),
+        )
+
+        text = " ".join(item[4] for item in line_words).strip()
+        if should_skip_text_block(text, line_rect, page.rect, template_mode="new"):
+            continue
+
+        has_qty = bool(re.search(r"(?i)\b(?:QTY|Quantity)\b", text))
+        if not looks_like_new_template_title_line(text):
+            continue
+
+        horizontal_gap = 0.0
+        if line_rect.x1 < r.x0:
+            horizontal_gap = r.x0 - line_rect.x1
+        elif line_rect.x0 > r.x1:
+            horizontal_gap = line_rect.x0 - r.x1
+
+        if horizontal_gap > 260:
+            continue
+
+        if line_rect.y1 < r.y0:
+            vertical_gap = (r.y0 - line_rect.y1) + 40.0
+        elif line_rect.y0 > r.y1:
+            vertical_gap = line_rect.y0 - r.y1
+        else:
+            vertical_gap = 0.0
+
+        if vertical_gap > 520:
+            continue
+
+        score = vertical_gap + (horizontal_gap * 2.2)
+        if has_qty:
+            score -= 30.0
+        if line_rect.y0 >= r.y1:
+            score -= 10.0
+
+        candidates.append((score, text, line_rect))
+
+    if not candidates:
+        return "", None
+
+    candidates.sort(key=lambda item: item[0])
+    _, best_text, best_rect = candidates[0]
+    return normalize_new_template_title_text(best_text), best_rect
+
+def extract_link_title_new(page: fitz.Page, rect: fitz.Rect, pad_px: float = 4.0, band_px: float = 28.0) -> Tuple[str, Optional[fitz.Rect]]:
+    """
+    Extraction path for the new Canva template.
+    New layout links the product title itself, with QTY shown on the same line.
+    Start with the old full-line capture, then normalize that line so downstream
+    parsing can reliably split "TYPE" from "QTY".
+    """
+    text, text_rect = extract_link_title_old(page, rect, pad_px=pad_px, band_px=band_px)
+    fallback_text, fallback_rect = extract_link_title_new_nearest_line(page, rect)
+
+    if fallback_text and (
+        not text
+        or "curated selections" in text.lower()
+        or "merav interiors" in text.lower()
+        or len(text.split()) > 8
+        or ("QTY" not in text.upper() and looks_like_new_template_title_line(fallback_text))
+        or len(fallback_text) > len(text) + 4
+    ):
+        text, text_rect = fallback_text, fallback_rect
+
+    if not text:
+        return text, text_rect
+
+    text = normalize_new_template_title_text(text)
+    return text, text_rect
+
+def _format_detected_room_name(name: str) -> str:
+    cleaned = " ".join((name or "").split()).strip(" |-")
+    if not cleaned:
+        return ""
+    return cleaned.title() if cleaned.upper() == cleaned else cleaned
+
+def extract_new_template_page_tag(page: fitz.Page) -> str:
+    page_rect = page.rect
+    blocks = page.get_text("blocks") or []
+    candidates: List[Tuple[float, str]] = []
+
+    for block in blocks:
+        if block[6] != 0:
+            continue
+        block_rect = fitz.Rect(block[0:4])
+        if block_rect.y1 > page_rect.height * 0.30:
+            continue
+        block_text = " ".join(str(block[4]).split())
+        if not block_text:
+            continue
+        match = CURATED_SELECTIONS_RE.search(block_text)
+        if match:
+            room_name = _format_detected_room_name(match.group(1))
+            if room_name:
+                candidates.append((block_rect.y0, room_name))
+
+    if candidates:
+        candidates.sort(key=lambda item: item[0])
+        return candidates[0][1]
+    return ""
+
+def should_skip_text_block(block_text: str, block_rect: fitz.Rect, page_rect: fitz.Rect, template_mode: str = "old") -> bool:
+    text = " ".join((block_text or "").split())
+    if not text:
+        return True
+
+    text_lower = text.lower()
+    if text_lower.startswith(("materials list", "material list")):
+        return True
+
+    if template_mode == "new":
+        if "curated selections" in text_lower:
+            return True
+        if "merav interiors" in text_lower or "by katie roberts" in text_lower:
+            return True
+        if block_rect.y0 >= page_rect.height * 0.90:
+            return True
+
+    return False
+
+def parse_page_number(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 1 else None
+    if isinstance(value, float):
+        if value.is_integer() and value >= 1:
+            return int(value)
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+    match = PAGE_NUMBER_RE.match(text)
+    if not match:
+        return None
+
+    page_no = int(match.group(1))
+    return page_no if page_no >= 1 else None
+
+def extract_link_title_for_template(
+    page: fitz.Page,
+    rect: fitz.Rect,
+    template_mode: str = "old",
+    pad_px: float = 4.0,
+    band_px: float = 28.0,
+) -> Tuple[str, Optional[fitz.Rect]]:
+    if template_mode == "new":
+        return extract_link_title_new(page, rect, pad_px=pad_px, band_px=band_px)
+    return extract_link_title_old(page, rect, pad_px=pad_px, band_px=band_px)
+
 def split_position_and_title_start(raw: str) -> Tuple[str, str]:
     s = (raw or "").strip()
     if not s:
@@ -340,6 +557,7 @@ TYPE_TO_ROOM_MAP_RAW = [
     # LIGHTING
     ("BEDROOM FANS", "LIGHTING"),
     ("CHANDELIER", "LIGHTING"),
+    ("SCONCE", "LIGHTING"),
     ("SCONCES", "LIGHTING"),
     ("PENDANT", "LIGHTING"),
     ("PENDANTS", "LIGHTING"),
@@ -357,9 +575,13 @@ TYPE_TO_ROOM_MAP_RAW = [
     ("TRIM PAINT", "PAINT"),
     ("WALL PAINT", "PAINT"),
     ("CEILING PAINT", "PAINT"),
+    ("CABINET FINISH", "PAINT"),
+    ("CABINETRY FINISH", "PAINT"),
     ("CABINETRY FINISHES", "PAINT"),
-    
+
     # PLUMBING
+    ("FAUCET", "PLUMBING"),
+    ("FAUCETS", "PLUMBING"),
     ("SINK FAUCET", "PLUMBING"),
     ("SINK FLANGE", "PLUMBING"),
     ("SINK", "PLUMBING"),
@@ -476,8 +698,9 @@ def extract_links_by_pages(
     only_listed_pages: bool = True,
     pad_px: float = 4.0,
     band_px: float = 28.0,
+    template_mode: str = "old",
     view_mode: str = "trade",  # "trade" (old behavior) or "room"
-    dedupe_by: str = "url_and_position",  # "url_and_position", "url_only", or "none"
+    dedupe_by: str = "url_and_title",  # "url_and_title", "url_only", or "none"
     type_to_room_map: Optional[Dict[str, str]] = None,  # Map of type -> room for auto-filling
 ) -> Tuple[pd.DataFrame, int]:
     doc = fitz.open("pdf", pdf_bytes)
@@ -488,14 +711,15 @@ def extract_links_by_pages(
     listed = set(page_to_tag.keys()) if page_to_tag else set()
     
     # Deduplication tracking
-    seen = set()  # Track (page, canonical_url, position) or (page, canonical_url) depending on dedupe_by
+    seen = set()  # Track (page, canonical_url, title) or (page, canonical_url) depending on dedupe_by
     duplicates_skipped = 0  # Count of duplicates removed
 
     for pidx, page in enumerate(doc, start=1):
         if only_listed_pages and page_to_tag and pidx not in listed:
             continue
 
-        tag_value = (page_to_tag or {}).get(pidx, "")
+        inferred_tag_value = extract_new_template_page_tag(page) if template_mode == "new" else ""
+        tag_value = (page_to_tag or {}).get(pidx, "") or inferred_tag_value
         room_value = (page_to_room or {}).get(pidx, _infer_room_from_tag(tag_value))
 
         # Get page dimensions to exclude top-right region (where titles are)
@@ -529,13 +753,19 @@ def extract_links_by_pages(
             # Skip links in top-right region (where page titles are)
             link_center_x = (r.x0 + r.x1) / 2.0
             link_center_y = (r.y0 + r.y1) / 2.0
-            if link_center_x >= top_right_x_min and link_center_y <= top_right_y_max:
+            if template_mode != "new" and link_center_x >= top_right_x_min and link_center_y <= top_right_y_max:
                 continue  # Skip top-right region
             
             processed_rects.append(r)
             link_rects.append((r, uri))
             
-            raw, text_rect = extract_link_title_strict(page, rect, pad_px=pad_px, band_px=band_px)
+            raw, text_rect = extract_link_title_for_template(
+                page,
+                rect,
+                template_mode=template_mode,
+                pad_px=pad_px,
+                band_px=band_px,
+            )
             position, title = split_position_and_title_start(raw)
 
             # Require that at least some text is actually within the link rectangle
@@ -549,9 +779,9 @@ def extract_links_by_pages(
                 continue
 
             # Deduplication check
-            if dedupe_by == "url_and_position":
-                # If we failed to read a position, fall back to URL-only dedupe on this page
-                dedupe_key = (pidx, canonical_uri, position) if position else (pidx, canonical_uri)
+            normalized_title = " ".join(title.split()).strip().lower()
+            if dedupe_by in ("url_and_title", "url_and_position"):
+                dedupe_key = (pidx, canonical_uri, normalized_title)
             elif dedupe_by == "url_only":
                 dedupe_key = (pidx, canonical_uri)
             else:  # "none"
@@ -596,11 +826,14 @@ def extract_links_by_pages(
                 "Finish/Color": fields.get("Finish/Color", ""),
                 "Dimensions": fields.get("Dimensions", ""),
                 "Product Website": uri,
-                "link_text": title,
+                "link_text": type_col if template_mode == "new" and type_col else title,
                 "Client Product Name": f"{tag_value.strip()} {fields.get('Type', '').strip()}".strip(),
                 "Vendor": _vendor_from_url(uri),
             })
-        
+
+        if template_mode == "new":
+            continue
+
         # Now process text blocks that don't have links
         # Get text blocks and check if they overlap with any link rectangle
         blocks = page.get_text("blocks")
@@ -640,11 +873,10 @@ def extract_links_by_pages(
             
             if overlaps_link or overlaps_used_text or not block_text:
                 continue
-            
-            # Skip common headings
-            if block_text.lower().startswith(("materials list", "material list")):
+
+            if should_skip_text_block(block_text, block_rect, page_rect, template_mode=template_mode):
                 continue
-            
+
             # This is a text block without a link - extract it with blank URL
             position, title = split_position_and_title_start(block_text)
             
@@ -1449,25 +1681,41 @@ with tab1:
         }
     )
     only_listed = st.checkbox("Only extract pages listed above", value=True)
+    st.radio(
+        "PDF template",
+        options=["old", "new"],
+        format_func=lambda x: "Old template" if x == "old" else "New template",
+        horizontal=True,
+        help="Choose the Canva PDF layout before extracting. The old template keeps the current extraction behavior untouched.",
+        key="template_mode",
+    )
+
+    if st.session_state.get("dedupe_mode") == "url_and_position":
+        st.session_state["dedupe_mode"] = "url_and_title"
 
     dedupe_mode = st.selectbox(
         "Deduplication mode",
-        options=["url_and_position", "url_only", "none"],
+        options=["url_and_title", "url_only", "none"],
         index=0,
         format_func=lambda x: {
-            "url_and_position": "Remove duplicates: same URL + same position on same page (recommended)",
+            "url_and_title": "Remove duplicates: same URL + same title on same page (recommended)",
             "url_only": "Remove duplicates: same URL on same page (keeps different positions)",
             "none": "No deduplication (keep all links)"
         }[x],
-        help="Choose how to handle duplicate links. 'url_and_position' is recommended to remove true duplicates while preserving legitimate multiple occurrences.",
+        help="Choose how to handle duplicate links. 'url_and_title' removes only exact duplicate items while preserving different titles that share one URL.",
         key="dedupe_mode_select"
     )
     # Store in session state for use in extraction
     st.session_state["dedupe_mode"] = dedupe_mode
 
-    # Initialize type-to-room mapping in session state (hardcoded list)
-    if "type_to_room_map" not in st.session_state:
-        st.session_state["type_to_room_map"] = {k.lower(): v for k, v in TYPE_TO_ROOM_MAP_RAW}
+    # Initialize type-to-room mapping in session state (hardcoded list).
+    # Merge defaults on every run so new built-in mappings appear immediately
+    # without wiping any session-level overrides.
+    default_type_to_room_map = {k.lower(): v for k, v in TYPE_TO_ROOM_MAP_RAW}
+    existing_type_to_room_map = st.session_state.get("type_to_room_map", {})
+    merged_type_to_room_map = default_type_to_room_map.copy()
+    merged_type_to_room_map.update(existing_type_to_room_map)
+    st.session_state["type_to_room_map"] = merged_type_to_room_map
 
     st.button(
         "Extract",
@@ -1485,42 +1733,45 @@ with tab1:
         try:
             # mapping_df is defined in the same script run; guard if not
             for _, row in mapping_df.iterrows():
-                p_raw = str(row.get("page", "")).strip()
+                p_raw = row.get("page", "")
                 t_raw = str(row.get("Tags", "")).strip()
-                if not p_raw:
+                p_no = parse_page_number(p_raw)
+                if p_no is None:
                     continue
-                try:
-                    p_no = int(p_raw)
-                    if p_no >= 1 and (num_pages is None or p_no <= num_pages):
-                        page_to_tag[p_no] = t_raw
-                except Exception:
-                    continue
+                if num_pages is None or p_no <= num_pages:
+                    page_to_tag[p_no] = t_raw
         except NameError:
             # If mapping_df isn't in scope (rare), just extract all pages without tags
             page_to_tag = {}
 
-        with st.spinner("Extracting links, positions & titles…"):
-            # Get dedupe_mode from session state (set by selectbox above)
-            dedupe_mode_value = st.session_state.get("dedupe_mode", "url_and_position")
-            # Get type-to-room mapping from session state
-            type_to_room_map_value = st.session_state.get("type_to_room_map", {})
-            
-            df, duplicates_skipped = extract_links_by_pages(
-                st.session_state["pdf_bytes"], page_to_tag, None,
-                only_listed_pages=only_listed,
-                pad_px=4.0,
-                band_px=28.0,
-                dedupe_by=dedupe_mode_value,
-                type_to_room_map=type_to_room_map_value
-            )
-        st.session_state["extracted_df"] = df if not df.empty else None
-        st.session_state["pending_extract"] = False
-        
-        # Show duplicate removal feedback
-        if duplicates_skipped > 0:
-            st.info(f"✅ Removed {duplicates_skipped} duplicate link(s) during extraction. Extracted {len(df)} unique link(s).")
-        elif dedupe_mode_value != "none":
-            st.success(f"✅ Extracted {len(df)} unique link(s).")
+        if only_listed and not page_to_tag:
+            st.session_state["pending_extract"] = False
+            st.warning("Add at least one valid page number in the Page → Tags table before using 'Only extract pages listed above'.")
+        else:
+            with st.spinner("Extracting links, positions & titles…"):
+                # Get dedupe_mode from session state (set by selectbox above)
+                dedupe_mode_value = st.session_state.get("dedupe_mode", "url_and_title")
+                template_mode_value = st.session_state.get("template_mode", "old")
+                # Get type-to-room mapping from session state
+                type_to_room_map_value = st.session_state.get("type_to_room_map", {})
+
+                df, duplicates_skipped = extract_links_by_pages(
+                    st.session_state["pdf_bytes"], page_to_tag, None,
+                    only_listed_pages=only_listed,
+                    pad_px=4.0,
+                    band_px=28.0,
+                    template_mode=template_mode_value,
+                    dedupe_by=dedupe_mode_value,
+                    type_to_room_map=type_to_room_map_value
+                )
+            st.session_state["extracted_df"] = df if not df.empty else None
+            st.session_state["pending_extract"] = False
+
+            # Show duplicate removal feedback
+            if duplicates_skipped > 0:
+                st.info(f"✅ Removed {duplicates_skipped} duplicate link(s) during extraction. Extracted {len(df)} unique link(s).")
+            elif dedupe_mode_value != "none":
+                st.success(f"✅ Extracted {len(df)} unique link(s).")
 
     # Always render editable table if we have data (only in Tab 1)
     if st.session_state.get("extracted_df") is not None:
